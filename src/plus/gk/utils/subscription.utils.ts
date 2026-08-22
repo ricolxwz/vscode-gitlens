@@ -51,7 +51,7 @@ export function isAccountAccessRequired(subscription: Subscription): boolean {
 	return subscription.account == null || subscription.account.verified === false;
 }
 
-export function computeSubscriptionState(subscription: Optional<Subscription, 'state'>): SubscriptionState {
+export function computeSubscriptionState(_subscription: Optional<Subscription, 'state'>): SubscriptionState {
 	return SubscriptionState.Paid;
 }
 
