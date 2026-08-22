@@ -241,6 +241,55 @@ function worktreeFromEvent(event: AgentSessionEvent): string | undefined {
 	return undefined;
 }
 
+/** Distinct, normalized, non-empty `worktree` values from a `cwdTimeline`, in the order they first
+ *  appear. `undefined` when the timeline is absent or names no worktree — callers should NOT
+ *  overwrite an existing `visitedWorktreePaths` with an empty array in that case. */
+function visitedFromTimeline(
+	timeline: { cwd: string; worktree?: string; at?: string }[] | undefined,
+): string[] | undefined {
+	if (timeline == null) return undefined;
+
+	const seen = new Set<string>();
+	const result: string[] = [];
+	for (const entry of timeline) {
+		if (!entry.worktree) continue;
+
+		const normalized = normalizePath(entry.worktree);
+		if (seen.has(normalized)) continue;
+
+		seen.add(normalized);
+		result.push(normalized);
+	}
+	return result.length > 0 ? result : undefined;
+}
+
+/** Unions `adds` (each an array or a single path, `undefined` skipped) into `existing`, normalizing
+ *  every path. Returns `existing` BY REFERENCE, unchanged, when nothing new is added — callers rely
+ *  on this to avoid firing spurious change events on every hook event / poll cycle when the visited
+ *  set hasn't actually grown. */
+function unionVisited(
+	existing: readonly string[] | undefined,
+	...adds: (string | readonly string[] | undefined)[]
+): readonly string[] | undefined {
+	const next = new Set(existing ?? []);
+	let grew = false;
+	for (const add of adds) {
+		if (add == null) continue;
+
+		const values = typeof add === 'string' ? [add] : add;
+		for (const value of values) {
+			if (!value) continue;
+
+			const normalized = normalizePath(value);
+			if (!next.has(normalized)) {
+				next.add(normalized);
+				grew = true;
+			}
+		}
+	}
+	return grew ? [...next] : existing;
+}
+
 /** Synthesizes an unresolvable ask for a `permission_requested` row that has no routable
  *  `PendingPermission` — a non-blocking `Notification`/`PermissionRequest` tail, or a
  *  poll-discovered live/revived row. None of these hold a blocking hook entry to route an
@@ -323,6 +372,8 @@ interface SessionContext {
 	model?: string;
 	/** CLI-resolved worktree root for the current cwd (authoritative when present). */
 	worktreePath?: string;
+	/** Distinct worktree roots observed via this event's cwdTimeline. */
+	visitedWorktreePaths?: string[];
 }
 
 type SerializedAgentSession = Omit<AgentSession, 'lastActivity' | 'phaseSince' | 'subagents'> & {
@@ -736,6 +787,7 @@ export class ClaudeCodeProvider implements AgentSessionProvider {
 			sessionName: event.sessionName,
 			model: event.model,
 			worktreePath: worktreeFromEvent(event),
+			visitedWorktreePaths: visitedFromTimeline(event.cwdTimeline),
 		};
 		const tag = this.sessionTag(event.sessionId, event.sessionName ?? 'unnamed');
 
@@ -2132,8 +2184,18 @@ export class ClaudeCodeProvider implements AgentSessionProvider {
 	}
 
 	private ensureSession(sessionId: string, context?: SessionContext): { index: number; changed: boolean } {
-		const { pid, workspacePath, isInWorkspace, cwd, initialCwd, planFile, sessionName, model, worktreePath } =
-			context ?? {};
+		const {
+			pid,
+			workspacePath,
+			isInWorkspace,
+			cwd,
+			initialCwd,
+			planFile,
+			sessionName,
+			model,
+			worktreePath,
+			visitedWorktreePaths,
+		} = context ?? {};
 
 		let index = this._sessions.findIndex(s => s.id === sessionId);
 		if (index < 0) {
@@ -2160,6 +2222,7 @@ export class ClaudeCodeProvider implements AgentSessionProvider {
 				isInWorkspace: createdWorkspacePath != null ? true : (isInWorkspace ?? false),
 				model: model,
 				worktreePath: worktreePath != null ? normalizePath(worktreePath) : undefined,
+				visitedWorktreePaths: unionVisited(undefined, visitedWorktreePaths, worktreePath),
 			});
 			Logger.debug(
 				`ClaudeCodeProvider.ensureSession: implicitly created ${this.sessionTag(sessionId, sessionName ?? 'unnamed')}`,
@@ -2192,6 +2255,11 @@ export class ClaudeCodeProvider implements AgentSessionProvider {
 		// present, so it seats ahead of the `resolveGitInfo` probe below (which still fills
 		// `commonPath` and remains the fallback for older CLIs that don't send `cwdTimeline`).
 		const updatedWorktreePath = worktreePath != null ? normalizePath(worktreePath) : existing.worktreePath;
+		const updatedVisitedWorktreePaths = unionVisited(
+			existing.visitedWorktreePaths,
+			visitedWorktreePaths,
+			updatedWorktreePath,
+		);
 		// Workspace membership follows the ATTRIBUTION, not the raw cwd: a scratch-dir excursion
 		// (cwd in /tmp, worktree kept) stays in-workspace via its worktree, while a genuine move to
 		// a repo outside the workspace honestly drops membership when events carry a cwd.
@@ -2225,7 +2293,8 @@ export class ClaudeCodeProvider implements AgentSessionProvider {
 			updatedModel !== existing.model ||
 			updatedCwd !== existing.cwd ||
 			updatedInitialCwd !== existing.initialCwd ||
-			updatedWorktreePath !== existing.worktreePath
+			updatedWorktreePath !== existing.worktreePath ||
+			updatedVisitedWorktreePaths !== existing.visitedWorktreePaths
 		) {
 			this._sessions[index] = {
 				...existing,
@@ -2238,6 +2307,7 @@ export class ClaudeCodeProvider implements AgentSessionProvider {
 				planFile: updatedPlanFile,
 				isInWorkspace: updatedIsInWorkspace,
 				worktreePath: updatedWorktreePath,
+				visitedWorktreePaths: updatedVisitedWorktreePaths,
 				// A worktree move can cross repos, and the spread would otherwise carry the old repo
 				// identity forward — which consumers prefer over the new worktree, pinning the card to
 				// the wrong repo. Drop it; the probe below refills it. Mirrors the poll's ended-record
@@ -2267,7 +2337,12 @@ export class ClaudeCodeProvider implements AgentSessionProvider {
 		// call per hook event for an answer we already have. A first seat (no prior worktree) still
 		// counts as a location change: the move may be out of a non-git dir whose probe latched
 		// `gitInfoUnresolvable`, and `commonPath` still needs the probe.
-		const locationNeedsProbe = cwdMoved && (worktreePath == null || worktreeMoved || existing.worktreePath == null);
+		//
+		// A worktree move is a location change on its own, even with the SAME cwd (cwdTimeline
+		// updated, cwd unchanged) — the `commonPath` drop above (`worktreeMoved ? undefined : …`)
+		// needs the probe to refill it, and without `worktreeMoved` here nothing else would fire it.
+		const locationNeedsProbe =
+			worktreeMoved || (cwdMoved && (worktreePath == null || existing.worktreePath == null));
 		if (locationNeedsProbe) {
 			this.getBookkeeping(sessionId).gitInfoUnresolvable = false;
 		}
@@ -2309,10 +2384,14 @@ export class ClaudeCodeProvider implements AgentSessionProvider {
 		this._resolveGitInfoInFlight.set(sessionId, cwd);
 		try {
 			let info: Awaited<ReturnType<typeof resolveGitInfo>> | undefined;
+			let failed = false;
 			try {
 				info = await resolveGitInfo(cwd);
 			} catch {
-				// Git not available or not a git repo — fall through to mark unresolvable below
+				// A transient git/spawn failure, distinct from a confirmed "not a repo" (`info ==
+				// null` below). Must not latch `gitInfoUnresolvable` — the next hook event retries
+				// via `ensureSession`'s `commonPath == null` check.
+				failed = true;
 				info = undefined;
 			}
 
@@ -2323,6 +2402,8 @@ export class ClaudeCodeProvider implements AgentSessionProvider {
 			// already left, so applying it would undo the newer location. Drop it — the `finally`
 			// below re-runs for the newest cwd.
 			if (this._resolveGitInfoPending.has(sessionId)) return;
+
+			if (failed) return;
 
 			const session = this._sessions[index];
 
@@ -2341,8 +2422,51 @@ export class ClaudeCodeProvider implements AgentSessionProvider {
 			// followed by a new session start).
 			if (info == null) {
 				this.getBookkeeping(sessionId).gitInfoUnresolvable = true;
-				if (cwd !== session.cwd) {
-					this._sessions[index] = { ...session, cwd: cwd };
+
+				// The cwd itself isn't a repo, but a CLI-seated worktree (from `cwdTimeline`, see
+				// `worktreeFromEvent`) may still name one — e.g. a scratch cwd like `/tmp/x` whose
+				// session the CLI attributed to a real worktree. Probe the worktree root inline, in
+				// the same in-flight window, so a scratch cwd doesn't leave `commonPath` permanently
+				// unresolved.
+				let worktreeInfo: Awaited<ReturnType<typeof resolveGitInfo>> | undefined;
+				let liveIndex = index;
+				let liveSession = session;
+				if (session.worktreePath != null && session.worktreePath !== cwd && session.commonPath == null) {
+					try {
+						worktreeInfo = await resolveGitInfo(session.worktreePath);
+					} catch {
+						worktreeInfo = undefined;
+					}
+
+					// Re-find and re-read after this second await, for both the success and
+					// fall-through writes below — the array can have been reassigned/spliced (e.g.
+					// `pruneDeadSessions`), or the session's own fields updated, while the probe ran.
+					liveIndex = this._sessions.findIndex(s => s.id === sessionId);
+					if (liveIndex < 0) return;
+
+					if (this._resolveGitInfoPending.has(sessionId)) return;
+
+					liveSession = this._sessions[liveIndex];
+				}
+
+				if (worktreeInfo != null) {
+					const worktreeFirstResolve = liveSession.initialCommonPath == null;
+					this._sessions[liveIndex] = {
+						...liveSession,
+						cwd: cwd,
+						commonPath: worktreeInfo.repoRoot,
+						initialWorktreePath: worktreeFirstResolve
+							? liveSession.worktreePath
+							: liveSession.initialWorktreePath,
+						initialCommonPath: worktreeFirstResolve ? worktreeInfo.repoRoot : liveSession.initialCommonPath,
+						visitedWorktreePaths: unionVisited(liveSession.visitedWorktreePaths, liveSession.worktreePath),
+					};
+					this._onDidChangeSessions.fire();
+					return;
+				}
+
+				if (cwd !== liveSession.cwd) {
+					this._sessions[liveIndex] = { ...liveSession, cwd: cwd };
 					this._onDidChangeSessions.fire();
 				}
 				return;
@@ -2379,6 +2503,7 @@ export class ClaudeCodeProvider implements AgentSessionProvider {
 					commonPath: info.repoRoot,
 					initialWorktreePath: updatedInitialWorktreePath,
 					initialCommonPath: updatedInitialCommonPath,
+					visitedWorktreePaths: unionVisited(session.visitedWorktreePaths, effectiveWorktreePath),
 				};
 				this._onDidChangeSessions.fire();
 			}
@@ -2717,12 +2842,21 @@ export class ClaudeCodeProvider implements AgentSessionProvider {
 							// worktree metadata, pinning the card to the wrong repo. Drop it and let the
 							// host backfill from the new worktree.
 							commonPath: worktreeMoved ? undefined : existing.commonPath,
+							visitedWorktreePaths: unionVisited(
+								existing.visitedWorktreePaths,
+								visitedFromTimeline(data.cwdTimeline),
+								data.worktrees,
+								nextWorktreePath,
+							),
 						};
 						changed = true;
 
-						// Nothing in the record to re-seat it with (older CLI), so resolve the new cwd
-						// once rather than leaving the row location-less.
-						if (nextWorktreePath == null && data.cwd) {
+						// Nothing in the record to re-seat it with (older CLI), or the record names a
+						// NEW worktree the drop above just cleared `commonPath` for — either way, resolve
+						// the cwd once rather than leaving the row location-less until some later event
+						// happens to change `cwd`/`worktreePath` again (a same-worktree poll afterward
+						// skips this branch entirely, since `worktreeMoved` goes false).
+						if (data.cwd && (nextWorktreePath == null || worktreeMoved)) {
 							void this.resolveGitInfo(data.sessionId, data.cwd);
 						}
 					}
@@ -2756,6 +2890,12 @@ export class ClaudeCodeProvider implements AgentSessionProvider {
 						isSubagent: false,
 						workspacePath: workspacePath,
 						worktreePath: worktreeRoot != null ? normalizePath(worktreeRoot) : undefined,
+						visitedWorktreePaths: unionVisited(
+							undefined,
+							visitedFromTimeline(data.cwdTimeline),
+							data.worktrees,
+							worktreeRoot != null ? normalizePath(worktreeRoot) : undefined,
+						),
 						cwd: data.cwd,
 						initialCwd: data.initialCwd ?? data.cwd,
 						planFile: data.planFile ?? undefined,
@@ -2792,6 +2932,12 @@ export class ClaudeCodeProvider implements AgentSessionProvider {
 					// Read straight from the CLI's durable record so ended sessions attach to branch
 					// cards / WIP rows / the resume picker at any age, no git probe.
 					worktreePath: worktreeRoot != null ? normalizePath(worktreeRoot) : undefined,
+					visitedWorktreePaths: unionVisited(
+						undefined,
+						visitedFromTimeline(data.cwdTimeline),
+						data.worktrees,
+						worktreeRoot != null ? normalizePath(worktreeRoot) : undefined,
+					),
 					cwd: data.cwd,
 					initialCwd: data.initialCwd ?? data.cwd,
 					planFile: data.planFile ?? undefined,
@@ -2886,6 +3032,12 @@ export class ClaudeCodeProvider implements AgentSessionProvider {
 								revivedWorkspacePath ?? (data.cwd == null ? existing.workspacePath : undefined),
 							isInWorkspace: data.cwd == null ? existing.isInWorkspace : revivedWorkspacePath != null,
 							worktreePath: revivedWorktreePath,
+							visitedWorktreePaths: unionVisited(
+								existing.visitedWorktreePaths,
+								visitedFromTimeline(data.cwdTimeline),
+								data.worktrees,
+								revivedWorktreePath,
+							),
 							// A worktree move can cross repos — drop the stale repo identity and let the
 							// probe below refill it.
 							commonPath: revivedWorktreePath !== existing.worktreePath ? undefined : existing.commonPath,
@@ -2898,7 +3050,12 @@ export class ClaudeCodeProvider implements AgentSessionProvider {
 						// The record's worktree is the CLI's own resolution; without one the probe owns
 						// attribution again.
 						this.getBookkeeping(data.sessionId).cliSeatedWorktree = revivedWorktreeRoot != null;
-						if (data.cwd != null && data.cwd !== existing.cwd) {
+						// A revive whose worktree moved but whose cwd happens to equal the prior one still
+						// dropped `commonPath` above and needs the probe to refill it.
+						if (
+							data.cwd != null &&
+							(data.cwd !== existing.cwd || revivedWorktreePath !== existing.worktreePath)
+						) {
 							void this.resolveGitInfo(data.sessionId, data.cwd);
 						}
 						changed = true;
@@ -2991,6 +3148,12 @@ export class ClaudeCodeProvider implements AgentSessionProvider {
 				subagents: subagents,
 				pendingPermission: pendingPermission,
 				worktreePath: worktreeRoot != null ? normalizePath(worktreeRoot) : undefined,
+				visitedWorktreePaths: unionVisited(
+					undefined,
+					visitedFromTimeline(data.cwdTimeline),
+					data.worktrees,
+					worktreeRoot != null ? normalizePath(worktreeRoot) : undefined,
+				),
 			});
 			changed = true;
 			discovered++;
@@ -3174,6 +3337,10 @@ export class ClaudeCodeProvider implements AgentSessionProvider {
 							// but `worktreePath` changed) only reaches us if we carry BOTH. Carrying
 							// `commonPath` alone froze the displayed worktree at first-discovery.
 							worktreePath: peerSession.worktreePath ?? existing.worktreePath,
+							visitedWorktreePaths: unionVisited(
+								existing.visitedWorktreePaths,
+								peerSession.visitedWorktreePaths,
+							),
 							commonPath: peerSession.commonPath ?? existing.commonPath,
 							// Pick up the peer's latest cwd so our backfill probe (queued below)
 							// targets the right path. Stale-cwd locally would just re-probe the

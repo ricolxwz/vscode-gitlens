@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 
 ### Added
 
+- Adds a _Start Agent Session..._ action to working-changes (WIP) rows in the _Commit Graph_ and to worktrees in the views &mdash; opens a terminal at the worktree running your default coding agent CLI, offering a choice when several are detected; _Resume Agent Session..._ now also appears on worktrees in the views
+- Adds a _Run Task on Worktree..._ action to worktree working-changes (WIP) rows in the _Commit Graph_ and to worktrees in the views &mdash; runs a VS Code task (from `tasks.json`, or auto-detected ones like npm scripts) with the worktree as its working directory and `GITLENS_WORKTREE_PATH` in its environment, so build, test, and launch tasks can target a worktree without opening it; each worktree keeps its recently run tasks at the top of the picker
 - Adds a _GitKraken AI Usage_ card to the _Account_ section of _GitLens Settings_ &mdash; shows your weekly credit allowance, how much of it you've used, and when it resets, along with your organization's shared pool when one applies ([#5743](https://github.com/gitkraken/vscode-gitlens/issues/5743))
   - Adds a compact AI usage meter to the account rollup in the _Commit Graph_ header and on _Home_, which opens the full meter in _GitLens Settings_ when clicked
   - Adds a _Get more AI credits_ action for paid plans, or guidance to contact an org admin for those who can't buy
@@ -36,6 +38,8 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 - Adds persistent automatic-rebase actions where its escalations land &mdash; when a run stops for you, the _Commit Graph_'s **Resolve** panel now keeps _Resume with AI_ and _Abort Rebase_ available (previously only offered by a transient toast), and the _Interactive Rebase Editor_'s paused view gains a _Continue with AI_ button that hands the rest of the rebase to automatic conflict resolution
 - Adds intent-aware natural language search to the _Commit Graph_ &mdash; "only show &hellip;" phrasings filter the graph to matches, "take me to &hellip;" phrasings jump to the commit, and searches that find nothing offer counted broader alternatives (e.g. _1000+ without the date filter_) instead of a dead end
 - Adds `committer:`, `type:merge`, and `-message:` (exclude) operators to commit search in the _Commit Graph_ and _Search & Compare_
+- Adds right-click context menus to branch cards in the _Commit Graph_ side bar's _Overview_ panel &mdash; the same native branch menu the side bar's _Branches_ panel offers &mdash; and a _Start Work..._ button between the _Current work_ and _Recent_ groups
+- Adds right-click context menus to agent sessions in the _Commit Graph_ &mdash; on the _Agents_ side bar panel's rows and the details panel's session cards and past sessions &mdash; with permission actions (_Allow_, _Always Allow_, _Deny_, or _Approve Plan_ / _Reject Plan_), _View Plan_, open and resume actions, worktree and terminal actions, _Copy Session Id_ / _Copy Last Prompt_, and _Archive Session_
 
 ### Changed
 
@@ -56,6 +60,9 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 - Improves natural language search to understand the repository &mdash; branch, tag, worktree, and contributor names resolve to the real thing instead of being guessed
 - Improves natural language search to explain how a query was interpreted via a tooltip on the generated query
 - Improves natural language search to recognize misspelled author names and offer counted corrections (e.g. _7 as 'Keith Daulton'_)
+- Changes branch cards in the _Commit Graph_ side bar's _Overview_ panel into a scope toggle &mdash; clicking a card scopes the graph to its branch as before, and clicking the scoped card clears the scope and returns you to the branch
+- Improves screen reader support for the _Commit Graph_ side bar's _Overview_ panel &mdash; a branch card now announces whether it is the active scope
+- Changes the _Commit Graph_ side bar to open to the _Overview_ panel by default, and improves the panel with loading skeletons, error and empty states, and a _Load More_ control that pages in branches older than the _Recent_ timeframe
 
 ### Fixed
 
@@ -74,6 +81,9 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 - Fixes the _Commit Graph_'s _Review_ mode choosing focus areas from wrong file details on large change sets &mdash; newly added files counted as modified, and changed-line counts included unchanged context ([#5658](https://github.com/gitkraken/vscode-gitlens/issues/5658))
 - Fixes a deep link that fails to open leaving its progress notification spinning indefinitely &mdash; the spinner cleared only when another link was opened, making the failure easy to miss ([#5651](https://github.com/gitkraken/vscode-gitlens/issues/5651))
 - Fixes refining a proposed commit plan in the _Commit Composer_ after leaving the panel and returning to it, or after a refinement failed &mdash; the plan on screen was silently discarded and replaced by a brand-new one generated from scratch instead of being refined
+- Fixes the _Recent_ header wrapping onto a second line in the _Commit Graph_ side bar's _Overview_ panel when the branch count runs wide
+- Fixes branch cards in the _Commit Graph_ side bar's _Overview_ panel counting ended agent sessions in their agent indicator
+- Fixes _Switch Branch..._ separating _Open Worktree_ from _Open Worktree in New Window_ in the _Commit Graph_'s branch context menus
 
 ## [19.0.1] - 2026-08-13
 

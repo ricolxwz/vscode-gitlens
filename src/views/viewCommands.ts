@@ -30,6 +30,8 @@ import { generateChangelogAndOpenMarkdownDocument } from '../commands/generateCh
 import type { OpenFileAtRevisionCommandArgs } from '../commands/openFileAtRevision.js';
 import type { OpenOnRemoteCommandArgs } from '../commands/openOnRemote.js';
 import type { RecomposeFromCommitCommandArgs } from '../commands/recomposeFromCommit.js';
+import type { RunTaskOnWorktreeCommandArgs } from '../commands/runTaskOnWorktree.js';
+import type { StartAgentSessionCommandArgs } from '../commands/startAgentSession.js';
 import type { ViewShowBranchComparison } from '../config.js';
 import type { GlCommands } from '../constants.commands.js';
 import { GlyphChars } from '../constants.js';
@@ -640,6 +642,45 @@ export class ViewCommands implements Disposable {
 		if (node.is('worktree')) return executeCoreCommand('openInIntegratedTerminal', node.worktree.uri);
 
 		return executeCoreCommand('openInIntegratedTerminal', Uri.file(node.repoPath));
+	}
+
+	@command('gitlens.views.startAgentSession')
+	@debug()
+	private startAgentSession(node: WorktreeNode) {
+		if (!node.is('worktree')) return Promise.resolve();
+
+		return executeCommand<StartAgentSessionCommandArgs>('gitlens.startAgentSession', {
+			cwd: node.worktree.uri.fsPath,
+		});
+	}
+
+	@command('gitlens.views.startAgentSessionWith')
+	@debug()
+	private startAgentSessionWith(node: WorktreeNode) {
+		if (!node.is('worktree')) return Promise.resolve();
+
+		return executeCommand<StartAgentSessionCommandArgs>('gitlens.startAgentSession', {
+			cwd: node.worktree.uri.fsPath,
+			pick: true,
+		});
+	}
+
+	@command('gitlens.runTaskOnWorktree:views')
+	@debug()
+	private runTaskOnWorktree(node: WorktreeNode) {
+		if (!node.is('worktree')) return Promise.resolve();
+
+		return executeCommand<RunTaskOnWorktreeCommandArgs>('gitlens.runTaskOnWorktree', {
+			worktreePath: node.worktree.uri.fsPath,
+		});
+	}
+
+	@command('gitlens.views.resumeAgentSession')
+	@debug()
+	private resumeAgentSession(node: WorktreeNode) {
+		if (!node.is('worktree')) return Promise.resolve();
+
+		return executeCommand('gitlens.agents.showResumeSessionPicker', { worktreePath: node.worktree.uri.fsPath });
 	}
 
 	@command('gitlens.views.pausedOperation.abort')
