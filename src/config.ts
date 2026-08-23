@@ -37,6 +37,7 @@ export interface Config {
 	readonly menus: boolean | MenuConfig;
 	readonly mode: ModeConfig;
 	readonly modes: ModesConfig | null;
+	readonly openInTerminalLocation: 'panel' | 'editor';
 	readonly partners: PartnersConfig | null;
 	readonly plusFeatures: PlusFeaturesConfig;
 	readonly rebaseEditor: RebaseEditorConfig;
@@ -1145,7 +1146,7 @@ interface VisualHistoryConfig {
 
 interface WorktreesConfig {
 	readonly defaultLocation: string | null;
-	readonly openAfterCreate: 'always' | 'alwaysNewWindow' | 'onlyWhenEmpty' | 'never' | 'prompt';
+	readonly openAfterCreate: 'newWindow' | 'currentWindow' | 'addToWorkspace' | 'none' | 'onlyWhenEmpty';
 	readonly promptForLocation: boolean;
 }
 

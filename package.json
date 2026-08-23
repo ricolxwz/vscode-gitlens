@@ -4,8 +4,8 @@
 	"description": "Supercharge Git within VS Code — Visualize code authorship at a glance via Git blame annotations and CodeLens, seamlessly navigate and explore Git repositories, gain valuable insights via rich visualizations and powerful comparison commands, and so much more",
 	"version": "19.0.1",
 	"engines": {
-		"node": ">= 22.18.0",
-		"pnpm": ">= 10.0.0",
+		"node": ">= 24",
+		"pnpm": ">= 11.0.0",
 		"vscode": "^1.101.0"
 	},
 	"license": "SEE LICENSE IN LICENSE",
@@ -3328,22 +3328,22 @@
 					},
 					"gitlens.worktrees.openAfterCreate": {
 						"type": "string",
-						"default": "prompt",
+						"default": "newWindow",
 						"enum": [
-							"always",
-							"alwaysNewWindow",
-							"onlyWhenEmpty",
-							"never",
-							"prompt"
+							"newWindow",
+							"currentWindow",
+							"addToWorkspace",
+							"none",
+							"onlyWhenEmpty"
 						],
 						"enumDescriptions": [
-							"Always open the new worktree in the current window",
 							"Always open the new worktree in a new window",
-							"Only open the new worktree in the current window when no folder is opened",
+							"Always open the new worktree in the current window",
+							"Always add the new worktree to the current workspace",
 							"Never open the new worktree",
-							"Always prompt to open the new worktree"
+							"Open the new worktree in the current window only when no folder is opened, otherwise in a new window. Choosing an After Creating option in the Create Worktree dialog replaces this with that direct choice."
 						],
-						"markdownDescription": "Specifies how and when to open a worktree after it is created",
+						"markdownDescription": "Specifies how and when to open a worktree after it is created. Choosing an _After Creating_ option in the Create Worktree dialog updates this setting.",
 						"scope": "resource",
 						"order": 12
 					},
@@ -4571,6 +4571,21 @@
 						"markdownDescription": "Specifies whether to automatically install and enable the GitKraken MCP. This only applies to VS Code 1.101 and later.",
 						"scope": "window",
 						"order": 50
+					},
+					"gitlens.openInTerminalLocation": {
+						"type": "string",
+						"default": "panel",
+						"enum": [
+							"panel",
+							"editor"
+						],
+						"enumDescriptions": [
+							"Open in the terminal panel",
+							"Open as an editor tab"
+						],
+						"markdownDescription": "Specifies where GitLens opens the terminals it creates",
+						"scope": "window",
+						"order": 90
 					},
 					"gitlens.terminal.overrideGitEditor": {
 						"type": "boolean",
@@ -6878,7 +6893,7 @@
 			},
 			{
 				"command": "gitlens.agents.copySessionId",
-				"title": "Copy Session Id",
+				"title": "Copy Session ID",
 				"icon": "$(copy)"
 			},
 			{
@@ -25328,13 +25343,17 @@
 				{
 					"command": "gitlens.views.startAgentSession",
 					"when": "viewItem =~ /gitlens:worktree\\b/ && !listMultiSelection && !gitlens:untrusted && !gitlens:hasVirtualFolders && gitlens:agents:enabled",
-					"group": "0_gitlens_worktree_1@1",
-					"alt": "gitlens.views.startAgentSessionWith"
+					"group": "0_gitlens_worktree_1@1"
+				},
+				{
+					"command": "gitlens.views.startAgentSessionWith",
+					"when": "viewItem =~ /gitlens:worktree\\b/ && !listMultiSelection && !gitlens:untrusted && !gitlens:hasVirtualFolders && gitlens:agents:enabled",
+					"group": "0_gitlens_worktree_1@2"
 				},
 				{
 					"command": "gitlens.views.resumeAgentSession",
 					"when": "viewItem =~ /gitlens:worktree\\b/ && !listMultiSelection && !gitlens:untrusted && !gitlens:hasVirtualFolders && gitlens:agents:enabled",
-					"group": "0_gitlens_worktree_1@2"
+					"group": "0_gitlens_worktree_1@3"
 				},
 				{
 					"command": "gitlens.views.revealWorktreeInExplorer",
@@ -28327,16 +28346,6 @@
 					"group": "1_gitlens_actions@4"
 				},
 				{
-					"command": "gitlens.stashChanges.multi:commitDetails",
-					"when": "listMultiSelection && !gitlens:readonly && !gitlens:untrusted && !gitlens:hasVirtualFolders && webview == gitlens.views.commitDetails && webviewItemsUnion =~ /gitlens:file\\b(?=.*?\\b\\+(staged|unstaged)\\b)(?!.*?\\b\\+(committed|stashed)\\b)/",
-					"group": "1_gitlens_actions@4"
-				},
-				{
-					"command": "gitlens.stashChanges.multi:graphDetails",
-					"when": "webviewItemsUnion =~ /gitlens:file\\b(?=.*?\\b\\+(staged|unstaged)\\b)(?!.*?\\b\\+(committed|stashed)\\b)/ && listMultiSelection && !gitlens:readonly && !gitlens:untrusted && !gitlens:hasVirtualFolders && (webview == gitlens.graph || webview == gitlens.views.graph)",
-					"group": "1_gitlens_actions@4"
-				},
-				{
 					"command": "gitlens.views.openFile:commitDetails",
 					"when": "webviewItem =~ /gitlens:file\\b/ && webview == gitlens.views.commitDetails",
 					"group": "2_gitlens_quickopen_file@3"
@@ -28921,27 +28930,31 @@
 				{
 					"command": "gitlens.graph.startAgentSession",
 					"when": "webviewItem =~ /^gitlens:wip\\b/ && !listMultiSelection && !gitlens:untrusted && !gitlens:hasVirtualFolders && gitlens:agents:enabled",
-					"group": "0_gitlens_worktree_1@1",
-					"alt": "gitlens.graph.startAgentSessionWith"
+					"group": "0_gitlens_worktree_1@1"
 				},
 				{
-					"command": "gitlens.graph.resumeAgentSession",
+					"command": "gitlens.graph.startAgentSessionWith",
 					"when": "webviewItem =~ /^gitlens:wip\\b/ && !listMultiSelection && !gitlens:untrusted && !gitlens:hasVirtualFolders && gitlens:agents:enabled",
 					"group": "0_gitlens_worktree_1@2"
 				},
 				{
-					"command": "gitlens.graph.revealWorktreeInExplorer",
-					"when": "webviewItem =~ /^gitlens:wip\\b/ && !listMultiSelection && !gitlens:hasVirtualFolders",
-					"group": "0_gitlens_worktree_2@1"
+					"command": "gitlens.graph.resumeAgentSession",
+					"when": "webviewItem =~ /^gitlens:wip\\b/ && !listMultiSelection && !gitlens:untrusted && !gitlens:hasVirtualFolders && gitlens:agents:enabled",
+					"group": "0_gitlens_worktree_1@3"
 				},
 				{
 					"command": "gitlens.openInIntegratedTerminal:graph",
 					"when": "webviewItem =~ /^gitlens:wip\\b/ && !listMultiSelection && !gitlens:hasVirtualFolders",
-					"group": "0_gitlens_worktree_2@2"
+					"group": "0_gitlens_worktree_2@1"
 				},
 				{
 					"command": "gitlens.runTaskOnWorktree:graph",
 					"when": "webviewItem =~ /^gitlens:wip\\b(?=.*?\\b\\+worktree\\b)/ && !listMultiSelection && !gitlens:untrusted && !gitlens:hasVirtualFolders",
+					"group": "0_gitlens_worktree_2@2"
+				},
+				{
+					"command": "gitlens.graph.revealWorktreeInExplorer",
+					"when": "webviewItem =~ /^gitlens:wip\\b/ && !listMultiSelection && !gitlens:hasVirtualFolders",
 					"group": "0_gitlens_worktree_2@3"
 				},
 				{
@@ -28967,6 +28980,11 @@
 				{
 					"command": "gitlens.copyWorkingChangesToWorktree:graph",
 					"when": "webviewItem =~ /^gitlens:wip\\b/ && !listMultiSelection && !gitlens:readonly && !gitlens:untrusted && !gitlens:hasVirtualFolders",
+					"group": "1_gitlens_actions@4"
+				},
+				{
+					"command": "gitlens.stashChanges.multi:graphDetails",
+					"when": "webviewItemsUnion =~ /gitlens:file\\b(?=.*?\\b\\+(staged|unstaged)\\b)(?!.*?\\b\\+(committed|stashed)\\b)/ && listMultiSelection && !gitlens:readonly && !gitlens:untrusted && !gitlens:hasVirtualFolders && (webview == gitlens.graph || webview == gitlens.views.graph)",
 					"group": "1_gitlens_actions@4"
 				},
 				{
@@ -29058,6 +29076,11 @@
 					"command": "gitlens.fetch:graph",
 					"when": "webviewItem =~ /gitlens:worktree\\b(?=.*?\\b\\+tracking\\b)/ && !gitlens:readonly && !gitlens:untrusted && !gitlens:hasVirtualFolders && gitlens:repos:withRemotes",
 					"group": "1_gitlens_actions@3"
+				},
+				{
+					"command": "gitlens.stashChanges.multi:commitDetails",
+					"when": "listMultiSelection && !gitlens:readonly && !gitlens:untrusted && !gitlens:hasVirtualFolders && webview == gitlens.views.commitDetails && webviewItemsUnion =~ /gitlens:file\\b(?=.*?\\b\\+(staged|unstaged)\\b)(?!.*?\\b\\+(committed|stashed)\\b)/",
+					"group": "1_gitlens_actions@4"
 				},
 				{
 					"command": "gitlens.changeUpstream:graph",
