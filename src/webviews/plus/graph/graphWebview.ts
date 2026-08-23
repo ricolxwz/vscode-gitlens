@@ -1,3 +1,5 @@
+import type { Handler } from '@eamodio/supertalk';
+import { SequencedChannel } from '@eamodio/supertalk-core/handlers/channel.js';
 import { changesModeOrDefault, isChangesColumnMode } from '@gitkraken/commit-graph/stats.js';
 import type { ColumnMode } from '@gitkraken/commit-graph/view.js';
 import type { CancellationToken, ColorTheme, ConfigurationChangeEvent, TextDocumentShowOptions } from 'vscode';
@@ -57,7 +59,6 @@ import { getRepositoryKey } from '@gitlens/utils/uri.js';
 import { satisfies } from '@gitlens/utils/version.js';
 import type { AgentSessionState } from '../../../agents/models/agentSessionState.js';
 import { isActiveAgentPhase } from '../../../agents/provider.js';
-import { areHooksAllowedForAgent } from '../../../agents/utils/agentHooks.js';
 import { fetchAvatarImageAsDataUri, getAvatarUri } from '../../../avatars.js';
 import { parseCommandContext } from '../../../commands/commandContext.utils.js';
 import type { OpenIssueOnRemoteCommandArgs } from '../../../commands/openIssueOnRemote.js';
@@ -67,12 +68,12 @@ import type {
 	GraphScrollMarkersAdditionalTypes,
 } from '../../../config.js';
 import type { GlCommands } from '../../../constants.commands.js';
-import type { ContextKeys } from '../../../constants.context.js';
 import type {
 	StoredGraphExcludedRef,
 	StoredGraphFilters,
 	StoredGraphRefType,
 	StoredGraphState,
+	StoredGraphWipDraft,
 } from '../../../constants.storage.js';
 import type {
 	GraphShownTelemetryContext,
@@ -102,17 +103,9 @@ import {
 	isCommitSigned,
 } from '../../../git/utils/-webview/commit.utils.js';
 import { stageConflictResolution } from '../../../git/utils/-webview/conflictResolution.utils.js';
-import {
-	getBestRemoteWithIntegration,
-	getRemoteIntegration,
-	getRemoteProviderUrl,
-	remoteSupportsIntegration,
-} from '../../../git/utils/-webview/remote.utils.js';
+import { getRemoteProviderUrl, remoteSupportsIntegration } from '../../../git/utils/-webview/remote.utils.js';
 import { getSiblingWorktreeBranches, getWorktreesByBranch } from '../../../git/utils/-webview/worktree.utils.js';
-import type { OnboardingChangeEvent } from '../../../onboarding/onboardingService.js';
-import type { UsageChangeEvent } from '../../../onboarding/usageTracker.js';
 import type { FeaturePreviewChangeEvent, SubscriptionChangeEvent } from '../../../plus/gk/subscriptionService.js';
-import { isAgentsBannerEnabled } from '../../../plus/gk/utils/-webview/mcp.utils.js';
 import {
 	isAccountAccessRequired,
 	isSubscriptionTrialOrPaidFromState,
@@ -123,12 +116,13 @@ import {
 } from '../../../plus/integrations/utils/-webview/pullRequest.merge.utils.js';
 import { showComparisonPicker } from '../../../quickpicks/comparisonPicker.js';
 import { showContributorsPicker } from '../../../quickpicks/contributorsPicker.js';
+import type { ReferencesQuickPickOptions2 } from '../../../quickpicks/referencePicker.js';
 import { showReferencePicker2 } from '../../../quickpicks/referencePicker.js';
 import { getRepositoryPickerTitleAndPlaceholder, showRepositoryPicker } from '../../../quickpicks/repositoryPicker.js';
 import { cancelAndDispose, toAbortSignal } from '../../../system/-webview/cancellation.js';
 import { executeCommand, executeCoreCommand, registerCommand } from '../../../system/-webview/command.js';
 import { configuration } from '../../../system/-webview/configuration.js';
-import { getContext, onDidChangeContext } from '../../../system/-webview/context.js';
+import { onDidChangeContext } from '../../../system/-webview/context.js';
 import type { StorageChangeEvent } from '../../../system/-webview/storage.js';
 import { isDarkTheme, isLightTheme } from '../../../system/-webview/vscode.js';
 import { getWebviewCommand } from '../../../system/decorators/command.js';
@@ -151,22 +145,18 @@ import {
 	getDetailsFolderCommands,
 	sharedDetailsFolderCommandRoutes,
 } from '../../commitDetails/detailsFolderCommands.js';
-import type { IpcParams, IpcResponse } from '../../ipc/handlerRegistry.js';
-import { ipcCommand, ipcRequest } from '../../ipc/handlerRegistry.js';
-import type { IpcNotification } from '../../ipc/models/ipc.js';
 import type { EventVisibilityBuffer, SubscriptionTracker } from '../../rpc/eventVisibilityBuffer.js';
 import { createRpcEvent } from '../../rpc/eventVisibilityBuffer.js';
 import { LaunchpadService } from '../../rpc/launchpadService.js';
 import { createSharedServices } from '../../rpc/services/common.js';
 import { proxyServices } from '../../rpc/services/proxy.js';
 import { WalkthroughService } from '../../rpc/walkthroughService.js';
-import type { GetOverviewEnrichmentResponse, GetOverviewWipResponse } from '../../shared/overviewBranches.js';
 import type { WebviewHost, WebviewProvider, WebviewShowingArgs } from '../../webviewProvider.js';
 import type { WebviewPanelShowCommandArgs, WebviewShowOptions } from '../../webviewsController.js';
 import { isSerializedState } from '../../webviewsController.js';
 import type { TimelineCommandArgs } from '../timeline/registration.js';
 import { checkForAbandonedComposeStashes } from './compose/utils.js';
-import type { DetailsItemContext, DetailsItemTypedContext } from './detailsProtocol.js';
+import type { DetailsItemContext, DetailsItemTypedContext, Wip } from './detailsProtocol.js';
 import type { GraphCommandsContext } from './graphCommands.js';
 import { getGraphCommands, GraphCommands } from './graphCommands.js';
 import type { GraphDataControllerContext } from './graphDataController.js';
@@ -179,7 +169,15 @@ import type { GraphProducersServiceContext } from './graphProducersService.js';
 import { GraphProducersService } from './graphProducersService.js';
 import type { GraphSearchServiceContext } from './graphSearchService.js';
 import { GraphSearchService } from './graphSearchService.js';
-import type { GraphServices } from './graphService.js';
+import type {
+	GraphAccessState,
+	GraphColumnsState,
+	GraphFiltersState,
+	GraphRepoStatus,
+	GraphServices,
+	GraphWorkingTreeChange,
+	GraphWorktreeEnrichment,
+} from './graphService.js';
 import { isSidebarOriginContext, resolveSidebarContextMenuAction } from './graphSidebarActionTelemetry.js';
 import { GraphSyncPublisher } from './graphSyncPublisher.js';
 import type { GraphSyncDataSource, GraphSyncHost } from './graphSyncPublisher.js';
@@ -196,15 +194,29 @@ import type { GraphWipServiceContext } from './graphWipService.js';
 import { GraphWipService } from './graphWipService.js';
 import type {
 	BranchState,
+	DidChangeBranchStateParams,
+	DidChangeParams,
+	DidChangeRepoConnectionParams,
+	DidChooseAuthorParams,
+	DidChooseComparisonParams,
+	DidChooseFileParams,
+	DidChooseRefParams,
+	DidFailRevealParams,
+	DidGetRowHoverParams,
 	DidGetSidebarDataParams,
+	DidRequestActiveSidebarPanelParams,
+	DidRequestGraphActionParams,
 	DidRequestOpenCompareModeParams,
 	DidRequestOpenTimelineScopeParams,
 	DidRequestSearchParams,
+	DidRequestVisualizationParams,
+	DidResolveGraphScopeParams,
 	emptySetMarker,
 	GetWipLineStatsResponse,
 	GetWipStatsResponse,
 	GraphActionTarget,
 	GraphAutoFetchMode,
+	GraphAvatars,
 	GraphColumnConfig,
 	GraphColumnModeFor,
 	GraphColumnName,
@@ -222,11 +234,15 @@ import type {
 	GraphIncludeOnlyRefs,
 	GraphItemContext,
 	GraphMinimapMarkerTypes,
-	GraphOverviewData,
 	GraphPinnedRef,
+	GraphRef,
+	GraphRefMetadataItem,
 	GraphRefOptData,
+	GraphRefsMetadata,
 	GraphRefType,
 	GraphRepository,
+	GraphRowsPayload,
+	GraphScope,
 	GraphScopeBranch,
 	GraphScopeOrigin,
 	GraphScrollMarkerTypes,
@@ -235,98 +251,14 @@ import type {
 	GraphSelection,
 	GraphShowAction,
 	GraphSidebarPanel,
-	GraphWalkthroughBannerState,
 	MergePullRequestParams,
+	MergePullRequestResult,
+	RowActionParams,
 	SidebarWorktreeChange,
 	State,
 	VisualizationMode,
 } from './protocol.js';
-import {
-	CancelLoadRowCommand,
-	ChooseAccountOrgCommand,
-	ChooseAuthorRequest,
-	ChooseComparisonRequest,
-	ChooseFileRequest,
-	ChooseRefRequest,
-	ChooseRepositoryCommand,
-	createWipRowId,
-	DidChangeAgentsBanner,
-	DidChangeAgentSessionsNotification,
-	DidChangeBranchStateNotification,
-	DidChangeCanInstallHooks,
-	DidChangeColumnsNotification,
-	DidChangeGraphConfigurationNotification,
-	DidChangeGraphWalkthroughBanner,
-	DidChangeGraphWalkthroughComplete,
-	DidChangeGraphWalkthroughStarted,
-	DidChangeLayoutPromptNotification,
-	DidChangeNotification,
-	DidChangeOrgSettings,
-	DidChangeOverviewNotification,
-	DidChangePinnedRefNotification,
-	DidChangeRefsVisibilityNotification,
-	DidChangeRepoConnectionNotification,
-	DidChangeRowsNotification,
-	DidChangeScrollMarkersNotification,
-	DidChangeSelectionNotification,
-	DidChangeSubscriptionNotification,
-	DidChangeWipDraftsNotification,
-	DidChangeWorkingTreeNotification,
-	DidFailRevealNotification,
-	DidFetchNotification,
-	DidInvalidateGraphTreemapNotification,
-	DidInvalidateScopeAnchorsNotification,
-	DidRequestActiveSidebarPanelNotification,
-	DidRequestGraphActionNotification,
-	DidRequestOpenCompareModeNotification,
-	DidRequestOpenTimelineScopeNotification,
-	DidRequestVisualizationNotification,
-	DidRequestWipRefetchNotification,
-	DidStartFeaturePreviewNotification,
-	DoubleClickedCommand,
-	EnableChangesColumnCommand,
-	GetAgentSessionsRequest,
-	GetCountsRequest,
-	GetMissingAvatarsCommand,
-	GetMissingRefsMetadataCommand,
-	GetMoreRowsCommand,
-	GetOverviewEnrichmentRequest,
-	GetOverviewRequest,
-	GetOverviewWipDetailedRequest,
-	GetOverviewWipRequest,
-	GetRowHoverRequest,
-	GetWipLineStatsRequest,
-	getWipRowWorktreePath,
-	GetWipStatsRequest,
-	GraphSyncResyncCommand,
-	isWipRowId,
-	LoadRowRequest,
-	MergePullRequestRequest,
-	OpenPullRequestDetailsCommand,
-	ProxyAvatarsCommand,
-	ResetGraphFiltersCommand,
-	ResolveGraphScopeRequest,
-	RowActionCommand,
-	SyncWipWatchesCommand,
-	TrackGraphDetailsCompareModeCommand,
-	TrackGraphDetailsComposeModeCommand,
-	TrackGraphDetailsResolveModeCommand,
-	TrackGraphDetailsReviewModeCommand,
-	TrackGraphDetailsWipShownCommand,
-	TrackGraphOverviewShownCommand,
-	TrackGraphScopeChangedCommand,
-	TreemapFileActionCommand,
-	UpdateColumnModeCommand,
-	UpdateColumnsCommand,
-	UpdateExcludeTypesCommand,
-	UpdateGraphConfigurationCommand,
-	UpdateGraphDisplayModeCommand,
-	UpdateIncludedRefsCommand,
-	UpdatePinnedRefCommand,
-	UpdateRefsVisibilityCommand,
-	UpdateSelectionCommand,
-	UpdateWipDraftCommand,
-} from './protocol.js';
+import { createWipRowId, getWipRowWorktreePath, isWipRowId } from './protocol.js';
 import type { GraphWebviewShowingArgs } from './registration.js';
 
 export interface SelectedRowState {
@@ -411,8 +343,10 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		}
 
 		// `resetRepositoryState` runs after `_repository` is reassigned, so its `invalidateScopeAnchors`
-		// call notifies for the new repoPath — leaving the webview's `_mergeBaseCache` entries keyed by
-		// the previous path stranded. Notify for the previous path explicitly to drop them.
+		// call fires for the new repoPath. The app sweeps every cached anchor on any invalidation
+		// regardless of `repoPath` (see `GraphScopeService.onScopeAnchorsInvalidated`), so this is
+		// belt-and-suspenders against a future consumer that scopes its sweep — fire for the previous
+		// path too so the webview's cache can't strand entries keyed to it.
 		const previousPath = this._repository?.path;
 		this._repository = value;
 		// Clear per-repo state that survived `resetRepositoryState` historically — `_selection` (last
@@ -433,7 +367,7 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		this._sidebarEventCounter.next();
 
 		if (previousPath != null && previousPath !== value?.path) {
-			void this.host.notify(DidInvalidateScopeAnchorsNotification, { repoPath: previousPath });
+			this._scopeAnchorsInvalidatedEvent.fire({ repoPath: previousPath });
 		}
 
 		if (this.host.ready) {
@@ -447,7 +381,7 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 	}
 
 	private _cancellations = new Map<CancellableOperations, CancellationTokenSource>();
-	/** In-flight `GetWipStatsRequest` batches. Unkeyed (see `onGetWipStats`) — batches must not cancel each
+	/** In-flight `wip.getStats` batches. Unkeyed (see `onGetWipStats`) — batches must not cancel each
 	 *  other, including when they overlap on a sha: ordering for those is settled per-sha on the client
 	 *  (`claimWipStatsRequest`), not by killing a sibling. This exists only so dispose can cancel them all. */
 	private readonly _wipStatsCancellations = new Set<CancellationTokenSource>();
@@ -480,30 +414,14 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 	// account becomes usable — see `onSubscriptionChanged`.
 	private _accountAccessRequired = false;
 
-	// Map value type is `() => Promise<boolean | void>` so we can include notify methods that don't
-	// return whether they sent (e.g. `notifyDidChangeBranchStateOnly`, `notifyDidChangeOverview`).
-	// The consumer in `sendPendingIpcNotifications` `void`s the call so the boolean is unused.
-	private readonly _ipcNotificationMap = new Map<IpcNotification<any>, () => Promise<boolean | void>>([
-		[DidChangeAgentSessionsNotification, () => this.notifyDidChangeAgentSessions()],
-		[DidChangeBranchStateNotification, () => this._producers.notifyDidChangeBranchStateOnly()],
-		[DidChangeColumnsNotification, this.notifyDidChangeColumns],
-		[DidChangeGraphConfigurationNotification, this.notifyDidChangeConfiguration],
-		[DidChangeNotification, () => this._data.notifyDidChangeState()],
-		[DidChangeOverviewNotification, () => this._panels.notifyDidChangeOverview()],
-		[DidChangePinnedRefNotification, this.notifyDidChangePinnedRef],
-		[DidChangeRefsVisibilityNotification, this.notifyDidChangeRefsVisibility],
-		[DidChangeScrollMarkersNotification, this.notifyDidChangeScrollMarkers],
-		[DidChangeSelectionNotification, this.notifyDidChangeSelection],
-		[DidChangeSubscriptionNotification, this.notifyDidChangeSubscription],
-		[DidChangeWipDraftsNotification, () => this._wip.notifyDidChangeWipDrafts()],
-		[DidChangeWorkingTreeNotification, () => this._wip.notifyDidChangeWorkingTree()],
-		[DidFetchNotification, this.notifyDidFetch],
-		[DidStartFeaturePreviewNotification, this.notifyDidStartFeaturePreview],
-	]);
+	// Set instead of building the (expensive) full-state / branch-state-only payload while hidden or not
+	// ready — building it would cost real work for a webview that can't receive it. Consumed on the next
+	// visibility-restore (`onVisibilityChanged`), which RE-PRODUCES fresh data rather than replaying
+	// anything: the RPC events' visibility buffer only replays what was actually produced, so an expensive
+	// plane defers production itself instead of relying on that buffer.
+	private _pendingStateRefresh = false;
+	private _pendingBranchStateRefresh = false;
 	private _selectedId?: string;
-	// Latest columns-write revision received from the webview (see UpdateColumnsParams.revision);
-	// echoed on every columns push so the webview can order pushes against its in-flight writes.
-	private _columnsRevision = 0;
 	private _selectedRows: Record<string, SelectedRowState> | undefined;
 	private _theme: ColorTheme | undefined;
 	private _repositoryEventsDisposable: Disposable | undefined;
@@ -524,10 +442,16 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 	/** Watermark: counter values up to here have already fired their post-rebuild invalidation. */
 	private _firedSidebarEventSeq = 0;
 
-	// Single writer for the rows-plane channels (rows/reachability/rowsStats/avatars/downstreams/
-	// refsMetadata). Owns the delivery cursors and `{generation, seq}` stamping; its sends go over the
-	// `queueable: false` `DidChangeRowsNotification` so a failed send is recovered ONLY by the publisher's
-	// own snapshot — never double-applied via a controller requeue.
+	// The rows plane's transport: a Supertalk SequencedChannel over the SAME RPC connection every other
+	// graph service uses, so a rows emission and the RPC call that follows it are FIFO-ordered against each
+	// other. `replay: 0` is deliberate — recovery here is the DOMAIN resync (a fresh snapshot), never a
+	// historical replay, so every gap must reach `onGap` instead of being papered over with stale deltas.
+	// Registered on both the initial and reconnect connections via `getRpcHandlers`; per-provider, so two
+	// graph webviews get two independent channels.
+	private readonly _rowsChannel = new SequencedChannel<GraphRowsPayload>('graph:rows', { replay: 0 });
+
+	// Single writer for the rows-plane channels (rows/reachability/rowsStats/downstreams). Owns the
+	// delivery cursors; ordering, gap detection, and generations belong to `_rowsChannel`.
 	private readonly _graphSync: GraphSyncPublisher;
 
 	// The eager Visualizations "stats loading" override now lives on `_data` (GraphDataController); the
@@ -589,13 +513,9 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			workspace.onDidChangeConfiguration(this.onWorkspaceConfigurationChanged, this),
 			this.container.storage.onDidChange(this.onStorageChanged, this),
 			this.container.subscription.onDidChange(this.onSubscriptionChanged, this),
-			this.container.onboarding.onDidChange(this.onOnboardingChanged, this),
-			this.container.walkthrough.onDidChangeProgress(this.onGraphWalkthroughProgressChanged, this),
-			this.container.usage.onDidChange(this.onUsageChanged, this),
 			// Bridge the host-side health signal onto the RPC event, carrying the repo path so the
 			// view can filter to the one it's showing instead of re-fetching on every repo's change.
 			this.container.gitHealth.onDidChange(repoPath => this._gitHealthChangedEvent.fire({ repoPath: repoPath })),
-			onDidChangeContext(this.onContextChanged, this),
 			this.container.subscription.onDidChangeFeaturePreview(this.onFeaturePreviewChanged, this),
 			// The bar's primary continue swaps between automatic/manual with the session
 			this.container.autoRebase.onDidChange(e => {
@@ -709,17 +629,13 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		this._agentStatusSubscriptions = undefined;
 
 		if (this.container.agentStatus != null) {
+			// Sessions reach webviews via the shared AgentsService RPC events (which do their own
+			// healing resubscribe) — this host-side subscription exists ONLY for the agents-scope
+			// refs-visibility recompute.
 			this._agentStatusSubscriptions = [
 				this.container.agentStatus.onDidChangeSessions(this.onAgentSessionsChanged, this),
-				this.container.agentStatus.onDidChangeHooksInstallState(
-					() => void this.notifyDidChangeCanInstallHooks(),
-					this,
-				),
 			];
 		}
-
-		void this.notifyDidChangeAgentSessions();
-		void this.notifyDidChangeCanInstallHooks();
 	}
 
 	private subscribeToTreemapInvalidations(): void {
@@ -731,9 +647,14 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		if (configuration.get('graph.experimental.visualizations.enabled') !== true) return;
 
 		this._treemapInvalidateSubscription = this.container.treemapAggregator.onDidInvalidate(repoPath => {
-			void this.host.notify(DidInvalidateGraphTreemapNotification, { repoPath: repoPath });
+			this._treemapInvalidatedEvent.fire({ repoPath: repoPath });
 		});
 	}
+
+	// `save-last`: a superseded invalidation is stale relative to whatever refetch the newest one
+	// triggers, so latest-wins is fine — matches the legacy notification's semantics, where a hidden
+	// webview only ever saw the newest queued postMessage on reveal.
+	private readonly _treemapInvalidatedEvent = createRpcEvent<{ repoPath: string }>('treemapInvalidated', 'save-last');
 
 	/** Shared collaborator members most service contexts declare — spread into the factories whose
 	 *  context type includes all of these. */
@@ -743,8 +664,8 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			host: this.host,
 			getRepository: () => this.repository,
 			getSession: () => this._data.session,
-			addPendingNotification: (notification: IpcNotification<any>) =>
-				this.host.addPendingIpcNotification(notification, this._ipcNotificationMap, this),
+			fireBranchStateChanged: (params: DidChangeBranchStateParams) => this._branchStateChangedEvent.fire(params),
+			deferBranchStateRefresh: () => (this._pendingBranchStateRefresh = true),
 		};
 	}
 
@@ -755,7 +676,6 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 	private createGraphCommandsContext(): GraphCommandsContext {
 		return {
 			container: this.container,
-			host: this.host,
 			getRepository: () => this.repository,
 			getSession: () => this._data.session,
 			getActiveSelection: () => this.activeSelection,
@@ -774,29 +694,37 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			showRemoteRefs: (repoPath, remoteName) => this.showRemoteRefs(repoPath, remoteName),
 			updatePinnedRef: (repoPath, ref) => this.updatePinnedRef(repoPath, ref),
 			_undoCommit: (ref, worktreePath) => this._undoCommit(ref, worktreePath),
+			fireRequestAction: params => this._requestActionEvent.fire(params),
+			fireRequestOpenCompareMode: params => this._requestOpenCompareModeEvent.fire(params),
 		};
 	}
 
 	/** Collaborator surface {@link GraphWipService} reaches for. `getRepository`/`getSession` read
 	 *  live provider state; the rest forward to provider state/methods that stay here — revision
-	 *  refs, pinned-ref lookup, the sidebar-worktree RPC event, and the pending-notification queue. */
+	 *  refs, pinned-ref lookup, the sidebar-worktree, WIP-drafts, and watches-closed RPC events. */
 	private createGraphWipContext(): GraphWipServiceContext {
 		return {
 			...this.createBaseServiceContext(),
 			getRevisionReference: (repoPath, id, type) => this.getRevisionReference(repoPath, id, type),
 			getPinnedRefId: repoPath => this.getFiltersByRepo(repoPath)?.pinnedRef?.id,
 			fireSidebarWorktreeChanges: changes => this._sidebarWorktreeEvent.fire({ changes: changes }),
+			fireDraftsChanged: drafts => this._wipDraftsChangedEvent.fire(drafts),
+			fireWatchesClosed: shas => this._wipWatchesClosedEvent.fire({ shas: shas }),
+			fireWorkingTreeChanged: change => this._workingTreeChangedEvent.fire(change),
+			fireWorktreeEnrichment: enrichment => this._worktreeEnrichmentEvent.fire(enrichment),
+			fireWipRefetched: refetch => this._wipRefetchedEvent.fire(refetch),
 		};
 	}
 
-	/** Collaborator surface {@link GraphProducersService} reaches for. `getRepository`/`getSession`/
-	 *  `getSync` read live provider state; `updateState` forwards to the data controller; cancellation
-	 *  and the pending-notification queue route through the provider's shared maps, which stay here. */
+	/** Collaborator surface {@link GraphProducersService} reaches for. `getRepository`/`getSession` read
+	 *  live provider state; `updateState` forwards to the data controller; the cancellation map, the
+	 *  branch-state RPC event, and the deferred-refresh flag route through the provider, which stays here. */
 	private createGraphProducersContext(): GraphProducersServiceContext {
 		return {
 			...this.createBaseServiceContext(),
-			getSync: () => this._graphSync,
 			updateState: immediate => this._data.updateState(immediate),
+			fireRefsMetadataChanged: metadata =>
+				this._refsMetadataChangedEvent.fire({ metadata: metadata, reset: true }),
 			createBranchStateOnlyCancellation: () => this.createCancellation('branchStateOnly'),
 		};
 	}
@@ -823,7 +751,12 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 				this._producers.commitSentBranchState(branchState, revision),
 			buildState: () => this.getState(),
 			clearSearch: () => this._searchService.clear(),
-			resetRefsMetadata: () => void this._producers.resetRefsMetadata(),
+			resetRefsMetadata: () => {
+				// Repo swap / clear: wipe AND re-anchor the webview — nothing else replaces the outgoing
+				// repo's map now that the full-state push no longer carries it.
+				this._producers.resetRefsMetadata();
+				this._producers.fireRefsMetadataChanged();
+			},
 			resetHoverCache: () => this.resetHoverCache(),
 			clearAvatarProxyCaches: () => {
 				this._avatarProxyCache.clear();
@@ -835,21 +768,19 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			continueSearchInBackground: query => this._searchService.continueInBackground(query),
 			notifySearchError: (query, results) => this._searchService.notifySearchError(query, results),
 			publishSearchState: () => this._searchService.publishState(),
-			notifyDidChangeOverview: () => void this._panels.notifyDidChangeOverview(),
+			notifyDidChangeOverview: () => this._panels.notifyDidChangeOverview(),
 			notifySidebarInvalidated: () => this._panels.notifySidebarInvalidated(),
-			notifyDidChangeCanInstallHooks: () => void this.notifyDidChangeCanInstallHooks(),
 			resetWipSendState: () => this._wip.resetSendState(),
 			clearWipStatusCache: () => this._wip.clearStatusCache(),
-			addPendingNotification: notification =>
-				this.host.addPendingIpcNotification(notification, this._ipcNotificationMap, this),
+			fireStateChanged: params => this._stateChangedEvent.fire(params),
+			deferStateRefresh: () => (this._pendingStateRefresh = true),
 		};
 	}
 
 	/** Collaborator surface {@link GraphPanelsService} reaches for. `getRepository`/`getSession`/
 	 *  `getLoading` read live provider state; `getPinnedRefId`/`getExcludedRefsByRepo`/`fetchWipStatus`/
 	 *  `computeWorktreeChanges` forward into the provider's stored filters and the WIP service's caches;
-	 *  `fireSidebarInvalidated` fires the provider's RPC event (subscribed in `getRpcServices`); the
-	 *  pending-notification queue routes through the provider's shared `_ipcNotificationMap`, which stays here. */
+	 *  `fireSidebarInvalidated` fires the provider's RPC event (subscribed in `getRpcServices`). */
 	private createGraphPanelsContext(): GraphPanelsServiceContext {
 		return {
 			...this.createBaseServiceContext(),
@@ -906,25 +837,25 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		};
 	}
 
-	/** Transport surface for the rows-plane publisher — `DidChangeRowsNotification` is `queueable: false`,
-	 *  so a failed send bypasses the controller's pending-notification queue and is recovered only by the
-	 *  publisher's own snapshot (no double-apply). */
+	/** Transport surface for the rows-plane publisher — the `graph:rows` SequencedChannel. `send` is void:
+	 *  the channel stamps `{generation, seq}` and the RECEIVER detects loss, so there is no delivery result
+	 *  to act on here (see `GraphSyncPublisher`'s module header). */
 	private createGraphSyncHost(): GraphSyncHost {
 		return {
 			isReady: () => this.host.ready,
 			isVisible: () => this.host.visible,
-			notify: async params => {
-				const ok = await this.host.notify(DidChangeRowsNotification, params, undefined);
-				if (!ok) {
-					// The publisher recovers with a snapshot on the next trigger; warn so storms/soaks can
-					// assert on delivery health from the persisted log.
-					Logger.warn(
-						`GraphSyncPublisher: rows-plane send failed (gen=${params.sync.generation}, seq=${params.sync.seq}, snapshot=${params.sync.snapshot === true}); will recover via snapshot`,
-					);
-				}
-				return ok;
+			send: params => this._rowsChannel.send(params),
+			newGeneration: () => {
+				this._rowsChannel.newGeneration();
 			},
 		};
+	}
+
+	/** The `graph:rows` channel rides the same RPC connection as every other graph service — registered
+	 *  here so `RpcHost` re-attaches it on reconnect too (its `disconnect()` bumps the epoch, which is what
+	 *  makes a fresh iframe's first emission a gen-fresh seq 0). */
+	getRpcHandlers(): Handler[] {
+		return [this._rowsChannel];
 	}
 
 	/** Read-only view onto the graph session/`_refsMetadata` for the publisher — mirrors exactly what the
@@ -936,7 +867,6 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			// `current.rows` pagination leaves behind. The session's window is a mutable array under the hood
 			// (never frozen); the publisher only reads it.
 			getSnapshotRows: () => this._data.session?.window as GitGraphRow[] | undefined,
-			getAvatars: () => this._data.session?.current.avatars,
 			getDownstreams: () => this._data.session?.current.downstreams,
 			getRowsStats: () => this._data.session?.current.rowsStats,
 			isRowsStatsLoading: () =>
@@ -950,41 +880,48 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 				const paging = this._data.session?.current.paging;
 				return paging != null ? { startingCursor: paging.startingCursor, hasMore: paging.hasMore } : undefined;
 			},
-			getRefsMetadata: () => this._producers.refsMetadata,
-			isRefsMetadataEnabled: () => this._producers.isRefsMetadataEnabled,
 		};
 	}
 
-	/** Flush any pending rows-plane state to the webview (delivers marks accumulated while hidden/not-ready,
-	 *  or recovers a previously-broken send with a snapshot). Records the connection-ready seq watermark
-	 *  first so the webview's post-bootstrap sync-hello can be satisfied by this connection's emissions
-	 *  instead of forcing a redundant second snapshot of the initial page. */
+	/** A fresh iframe reached ready — first boot, or a hard refresh that replaced the HTML. Either way it
+	 *  holds NO rows plane (the bootstrap `State` carries none), so force a snapshot: `RpcHost.expose`
+	 *  already cycled the channel, so this ships as the new session's seq 0 and the fresh receiver adopts
+	 *  it with no gap. On a first boot the publisher is snapshot-required anyway, so this costs nothing. */
 	onReady(): void {
-		this._graphSync.onConnectionReady();
+		this._graphSync.requireSnapshot();
 		void this._graphSync.flush();
-		// Ready is the other edge a secondary-WIP tick can defer on (`runWipRefetch`), and unlike hidden
-		// it resolves without any visibility or focus transition — so nothing else would ever flush it.
+		// Ready is the other edge a WIP tick can defer on (`runWipRefetch` / `runNotifyDidChangeWorkingTree`),
+		// and unlike hidden it resolves without any visibility or focus transition — so nothing else would
+		// ever flush it.
+		this._wip.flushDeferredWorkingTree();
 		this._wip.recoverDeferredSecondaryWip();
-		// Bootstrap State doesn't carry agent sessions — the app seeds them with a request that can
-		// race the provider's cold-start import, and a pre-ready change sits in the pending map,
-		// which a reconnect clears. Push the current snapshot on every (re)connect so a booted
-		// iframe can never wedge empty.
-		void this.notifyDidChangeAgentSessions();
+		// Same edge for the deferred state/branch-state refreshes: an event landing before ready sets
+		// the flag, and an already-visible webview never gets the visibility transition that would
+		// otherwise drain it (the legacy path drained its pending queue right here at ready).
+		// `includeBootstrap` clears the flags when a fresh bootstrap supersedes them, so anything
+		// still set here was deferred after that snapshot — re-produce it.
+		if (this._pendingStateRefresh) {
+			this._pendingStateRefresh = false;
+			void this._data.notifyDidChangeState();
+		}
+
+		if (this._pendingBranchStateRefresh) {
+			this._pendingBranchStateRefresh = false;
+			void this._producers.notifyDidChangeBranchStateOnly();
+		}
 	}
 
-	/** A soft-reconnected iframe re-boots from the ORIGINAL bootstrap plus the replay buffer — anything
-	 *  the buffer no longer holds (pruned by a State reset, or an expired window) is invisible to it.
-	 *  Re-record the connection watermark so the reconnect's sync-hello can only be satisfied by
-	 *  emissions made from this point on: a hello reporting an older baseline forces a fresh snapshot
-	 *  instead of trusting a possibly-pruned replay. (Within-window reloads pay one redundant snapshot —
-	 *  rare path, correctness over bytes.) */
+	/** A soft-reconnected iframe re-boots from the ORIGINAL bootstrap, which carries NO rows plane — and
+	 *  rows never rode the replay buffer, so the new iframe holds nothing. Force a snapshot: `RpcHost.expose`
+	 *  already cycled the channel (its `disconnect()` bumped the epoch), so this ships as the new session's
+	 *  seq 0 and the fresh receiver adopts it with no gap. (Within-window reloads pay one redundant
+	 *  snapshot — rare path, correctness over bytes.) */
 	onReconnect(): void {
-		this._graphSync.onConnectionReady();
+		this._graphSync.requireSnapshot();
 		void this._graphSync.flush();
 		// See onReady — a reconnect crosses the same not-ready window.
+		this._wip.flushDeferredWorkingTree();
 		this._wip.recoverDeferredSecondaryWip();
-		// See onReady — the reconnect also cleared any pending agent-sessions notification.
-		void this.notifyDidChangeAgentSessions();
 	}
 
 	private _disposed = false;
@@ -1006,10 +943,8 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		this._producers.dispose();
 		// Cancel the other debounced notifiers too — a trailing fire after dispose would call
 		// `host.notify()` on a torn-down host (the exact class of bug this dispose pass exists
-		// to fix). `_fireSelectionChangedDebounced` is technically host-I/O-free but cancelling
-		// it still clears its pending timer.
+		// to fix).
 		this._data.cancelDebouncedNotifiers();
-		this._fireSelectionChangedDebounced?.cancel();
 		this._data.disposeSession();
 		this._graphSync.dispose();
 		// The periodic interval set by `ensureLastFetchedSubscription` was previously not cleaned
@@ -1034,6 +969,97 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 	private readonly _sidebarWorktreeEvent = createRpcEvent<{
 		changes: Record<string, SidebarWorktreeChange | undefined>;
 	}>('sidebarWorktreeState', 'save-last');
+	// `save-last`: the payload is a complete gating snapshot, so a hidden webview only ever needs the
+	// newest one — and replaying it on show is exactly right.
+	private readonly _accessChangedEvent = createRpcEvent<GraphAccessState>('accessChanged', 'save-last');
+	// `save-last`: only the current repo's fetch matters to the app, so latest-wins is correct —
+	// see `GraphRepoStatusService.onDidFetch`.
+	private readonly _repoStatusEvent = createRpcEvent<GraphRepoStatus>('repoStatus', 'save-last');
+	// `save-last`: the payload is always the complete `State` rebuild, so a hidden webview only ever
+	// needs the newest one — see `GraphStateService.onStateChanged`.
+	private readonly _stateChangedEvent = createRpcEvent<DidChangeParams>('stateChanged', 'save-last');
+	// `save-last`: each payload is a complete replacement and only the newest matters to a hidden
+	// webview — see `GraphRepoStatusService.onBranchStateChanged`.
+	private readonly _branchStateChangedEvent = createRpcEvent<DidChangeBranchStateParams>(
+		'branchStateChanged',
+		'save-last',
+	);
+	// `save-last`: the payload is always a complete repositories snapshot — see
+	// `GraphRepoStatusService.onRepoConnectionChanged`.
+	private readonly _repoConnectionChangedEvent = createRpcEvent<DidChangeRepoConnectionParams>(
+		'repoConnectionChanged',
+		'save-last',
+	);
+	// `save-last`: the payload is always the complete component config, so a hidden webview only
+	// ever needs the newest one — see `GraphConfigurationService.onDidChange`.
+	private readonly _configurationChangedEvent = createRpcEvent<GraphComponentConfig>(
+		'configurationChanged',
+		'save-last',
+	);
+	// `save-last`: the payload is always the complete columns + contexts snapshot, so a hidden webview
+	// only ever needs the newest one — see `GraphColumnsService.onDidChange`.
+	private readonly _columnsChangedEvent = createRpcEvent<GraphColumnsState>('columnsChanged', 'save-last');
+	// `save-last`: the payload is always the complete filters snapshot, so a hidden webview only ever
+	// needs the newest one — see `GraphFiltersService.onDidChange`.
+	private readonly _filtersChangedEvent = createRpcEvent<GraphFiltersState>('filtersChanged', 'save-last');
+	// `save-last`: the payload is always the complete per-panel WIP-drafts slice, so a hidden webview
+	// only ever needs the newest one — see `GraphWipService.onDraftsChanged`.
+	private readonly _wipDraftsChangedEvent = createRpcEvent<Record<string, StoredGraphWipDraft> | undefined>(
+		'wipDraftsChanged',
+		'save-last',
+	);
+	// `save-last`, but the payload is CUMULATIVE (every sha closed since the last `syncWatches`), not a
+	// full-state snapshot — see `GraphWipService.onWatchesClosed` for why.
+	private readonly _wipWatchesClosedEvent = createRpcEvent<{ shas: string[] }>('wipWatchesClosed', 'save-last');
+	// The working-tree plane is split across TWO events keyed separately on purpose — the tick and the
+	// background probe produce DISJOINT payloads, so one shared `save-last` slot would let a probe
+	// swallow a tick's `wip` for good. See `GraphWipService.onWorkingTreeChanged` / `onWorktreeEnrichment`.
+	private readonly _workingTreeChangedEvent = createRpcEvent<GraphWorkingTreeChange>(
+		'workingTreeChanged',
+		'save-last',
+	);
+	private readonly _worktreeEnrichmentEvent = createRpcEvent<GraphWorktreeEnrichment>(
+		'worktreeEnrichment',
+		'save-last',
+	);
+	// `save-last`: a superseded refetch is an older read of the same worktree, and the client orders by
+	// `Wip.revision` regardless — see `GraphWipService.onWipRefetched`.
+	private readonly _wipRefetchedEvent = createRpcEvent<{ repoPath: string; wip?: Wip }>('wipRefetched', 'save-last');
+	// The five navigation events — all `save-last`, all keyed separately so a hidden webview keeps the
+	// newest of EACH rather than letting one kind of request drop another. See `GraphNavigationService`.
+	// Only WARM pushes fire these: a cold show (or one that switches repositories) routes through the
+	// state bootstrap instead, so the request lands with the repo's state rather than racing it.
+	private readonly _requestActionEvent = createRpcEvent<DidRequestGraphActionParams>('requestAction', 'save-last');
+	private readonly _requestOpenCompareModeEvent = createRpcEvent<DidRequestOpenCompareModeParams>(
+		'requestOpenCompareMode',
+		'save-last',
+	);
+	private readonly _requestOpenTimelineScopeEvent = createRpcEvent<DidRequestOpenTimelineScopeParams>(
+		'requestOpenTimelineScope',
+		'save-last',
+	);
+	private readonly _requestVisualizationEvent = createRpcEvent<DidRequestVisualizationParams>(
+		'requestVisualization',
+		'save-last',
+	);
+	private readonly _requestActiveSidebarPanelEvent = createRpcEvent<DidRequestActiveSidebarPanelParams>(
+		'requestActiveSidebarPanel',
+		'save-last',
+	);
+	// `save-last`: the payload is the complete selection map, so a hidden webview only ever needs the
+	// newest one — and `State.selectedRows` re-seeds it on the next bootstrap anyway. Only HOST-initiated
+	// reveals fire this; a user's own click is never echoed back. See `GraphSelectionService`.
+	private readonly _selectionChangedEvent = createRpcEvent<GraphSelectedRows>('selectionChanged', 'save-last');
+	// `save-last`: each payload names the one ref the host gave up on, and only the newest failed jump is
+	// worth surfacing on show. See `GraphSelectionService.onRevealFailed`.
+	private readonly _revealFailedEvent = createRpcEvent<DidFailRevealParams>('revealFailed', 'save-last');
+	// RESET-CLASS ONLY — every payload is a COMPLETE refsMetadata snapshot (`null` = feature off), so
+	// `save-last` is safe: a hidden webview replays the newest one on show and holds exactly what the host
+	// holds. Incremental enrichment never rides this; it returns from `getMissingRefsMetadata`.
+	private readonly _refsMetadataChangedEvent = createRpcEvent<{
+		metadata: GraphRefsMetadata | null;
+		reset: true;
+	}>('refsMetadataChanged', 'save-last');
 
 	getRpcServices(buffer?: EventVisibilityBuffer, tracker?: SubscriptionTracker): GraphServices {
 		const base = createSharedServices(this.container, this.host, () => {}, buffer, tracker);
@@ -1041,6 +1067,42 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 
 		return proxyServices({
 			...base,
+			access: {
+				getAccess: () => this.getAccessState(),
+				onAccessChanged: this._accessChangedEvent.subscribe(buffer, tracker),
+			},
+			avatars: {
+				getMissingAvatars: emails => this.getMissingAvatars(emails),
+				proxyAvatars: avatars => this.proxyAvatars(avatars),
+			},
+			refsMetadata: {
+				getMissingRefsMetadata: (metadata, signal) => this._producers.getMissingRefsMetadata(metadata, signal),
+				onRefsMetadataChanged: this._refsMetadataChangedEvent.subscribe(buffer, tracker),
+			},
+			columns: {
+				getColumns: () => Promise.resolve(this.getColumnsState()),
+				setColumns: config => this.setColumns(config),
+				setColumnMode: (name, mode) => this.updateColumnMode(name, mode),
+				enableChangesColumn: () => this.enableChangesColumn(),
+				onDidChange: this._columnsChangedEvent.subscribe(buffer, tracker),
+			},
+			configuration: {
+				getConfiguration: () => Promise.resolve(this.getComponentConfig()),
+				update: changes => this.updateGraphConfig(changes),
+				setDisplayMode: mode => this.setDisplayMode(mode),
+				onDidChange: this._configurationChangedEvent.subscribe(buffer, tracker),
+			},
+			filters: {
+				getFilters: () => this.getFiltersState(),
+				setRefsVisibility: (refs, visible) =>
+					this.updateExcludedRefs(this._data.session?.repoPath, refs, visible),
+				setPinnedRef: ref => this.updatePinnedRef(this._data.session?.repoPath, ref),
+				setExcludeType: (key, value) => this.updateExcludedTypes(this._data.session?.repoPath, key, value),
+				setIncludedRefs: (branchesVisibility, refs) =>
+					this.updateIncludeOnlyRefs(this._data.session?.repoPath, branchesVisibility, refs),
+				reset: () => this.resetFilters(this._data.session?.repoPath),
+				onDidChange: this._filtersChangedEvent.subscribe(buffer, tracker),
+			},
 			graphInspect: graphInspect,
 			search: this._searchService.createServices(buffer, tracker).search,
 			sidebar: {
@@ -1048,7 +1110,7 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 					this.onGetSidebarData({ panel: panel, displayed: options?.displayed }, signal),
 				getSidebarCounts: () => this.onGetCounts(),
 				// Straight to the shared 10s status cache — see `getWorktreeWipStats` on the interface for why
-				// this deliberately does NOT reuse `GetWipStatsRequest`.
+				// this deliberately does NOT reuse `wip.getStats`.
 				// `normalizePath` because the client sends `Uri.fsPath`: on Windows that would key the cache
 				// with backslashes, which neither the graph's readers nor the FS-watcher evictor ever match.
 				getWorktreeWipStats: async (path, signal) =>
@@ -1061,6 +1123,14 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 					this.onSidebarAction({ command: command, context: context, args: args }),
 				onSidebarInvalidated: this._sidebarInvalidatedEvent.subscribe(buffer, tracker),
 				onWorktreeStateChanged: this._sidebarWorktreeEvent.subscribe(buffer, tracker),
+			},
+			selection: {
+				updateSelection: selection => {
+					this.updateSelection(selection);
+					return Promise.resolve();
+				},
+				onSelectionChanged: this._selectionChangedEvent.subscribe(buffer, tracker),
+				onRevealFailed: this._revealFailedEvent.subscribe(buffer, tracker),
 			},
 			welcome: { continueToGraph: options => this.onWelcomeContinueToGraph(options) },
 			graphHealth: {
@@ -1080,9 +1150,68 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 				onHealthChanged: this._gitHealthChangedEvent.subscribe(buffer, tracker),
 			},
 			launchpad: new LaunchpadService(this.container, buffer, tracker),
+			navigation: {
+				onRequestAction: this._requestActionEvent.subscribe(buffer, tracker),
+				onRequestOpenCompareMode: this._requestOpenCompareModeEvent.subscribe(buffer, tracker),
+				onRequestOpenTimelineScope: this._requestOpenTimelineScopeEvent.subscribe(buffer, tracker),
+				onRequestVisualization: this._requestVisualizationEvent.subscribe(buffer, tracker),
+				onRequestActiveSidebarPanel: this._requestActiveSidebarPanelEvent.subscribe(buffer, tracker),
+			},
 			walkthrough: new WalkthroughService(this.container, buffer, tracker),
 			graphTimeline: graphTimeline,
-			graphTreemap: graphTreemap,
+			graphTreemap: {
+				...graphTreemap,
+				onDidInvalidate: this._treemapInvalidatedEvent.subscribe(buffer, tracker),
+			},
+			repoStatus: {
+				getLastFetched: () => this.getRepoStatus(),
+				onDidFetch: this._repoStatusEvent.subscribe(buffer, tracker),
+				onBranchStateChanged: this._branchStateChangedEvent.subscribe(buffer, tracker),
+				onRepoConnectionChanged: this._repoConnectionChangedEvent.subscribe(buffer, tracker),
+			},
+			state: {
+				onStateChanged: this._stateChangedEvent.subscribe(buffer, tracker),
+			},
+			rows: {
+				getMoreRows: (id, limit) => this._data.onGetMoreRows(id, limit),
+				loadRow: (id, signal) => this._data.loadRow(id, signal),
+				resyncRows: () => this._data.resyncRows(),
+			},
+			scope: {
+				resolveScope: (repoPath, scope, signal) => this.resolveGraphScope(repoPath, scope, signal),
+				onScopeAnchorsInvalidated: this._scopeAnchorsInvalidatedEvent.subscribe(buffer, tracker),
+			},
+			...this._panels.createServices(buffer, tracker),
+			wip: {
+				getLineStats: (repoPath, signal) => this.onGetWipLineStats(repoPath, signal),
+				getStats: (shas, options, signal) => this.onGetWipStats(shas, options, signal),
+				updateDraft: (worktreePath, draft) => this._wip.writeWipDraftToStorage(worktreePath, draft),
+				onDraftsChanged: this._wipDraftsChangedEvent.subscribe(buffer, tracker),
+				syncWatches: shas => this._wip.syncWipWatches(shas),
+				onWatchesClosed: this._wipWatchesClosedEvent.subscribe(buffer, tracker),
+				onWorkingTreeChanged: this._workingTreeChangedEvent.subscribe(buffer, tracker),
+				onWorktreeEnrichment: this._worktreeEnrichmentEvent.subscribe(buffer, tracker),
+				onWipRefetched: this._wipRefetchedEvent.subscribe(buffer, tracker),
+			},
+			hover: {
+				getRowHover: (type, id, signal) => this.getRowHover(type, id, signal),
+			},
+			pickers: {
+				chooseRef: (title, placeholder, options) => this.chooseRef(title, placeholder, options),
+				chooseComparison: title => this.chooseComparison(title),
+				chooseAuthor: (title, placeholder, picked) => this.chooseAuthor(title, placeholder, picked),
+				chooseFile: (title, type, options) => this.chooseFile(title, type, options),
+				chooseRepository: () => this.chooseRepository(),
+				chooseAccountOrg: () => this.chooseAccountOrg(),
+			},
+			pullRequest: {
+				merge: (number, options) => this.mergePullRequest(number, options),
+			},
+			rowActions: {
+				executeRowAction: params => this.executeRowAction(params),
+				handleRefDoubleClick: (ref, metadata) => this.handleRefDoubleClick(ref, metadata),
+				openTreemapFile: (action, repoPath, path) => this.openTreemapFile(action, repoPath, path),
+			},
 		} satisfies GraphServices);
 	}
 
@@ -1211,14 +1340,14 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			}
 
 			if (unresolved) {
-				void this.host.notify(DidFailRevealNotification, { id: id, reason: 'invalidRef' });
+				this._revealFailedEvent.fire({ id: id, reason: 'invalidRef' });
 			} else {
 				this.setSelectedRows(id);
 
 				if (this._data.session != null) {
 					// Synthetic WIP rows can't be paged in via `onGetMoreRows`; selecting + notifying is enough.
 					if (isWipRow || this._data.session.current.ids.has(id)) {
-						void this.notifyDidChangeSelection();
+						this.notifyDidChangeSelection();
 						return [true, this.getShownTelemetryContext()];
 					}
 
@@ -1241,19 +1370,19 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			if (loading || repoChanged || !this.host.ready) {
 				this._pendingVisualization = arg.visualization;
 			} else {
-				void this.host.notify(DidRequestVisualizationNotification, { visualization: arg.visualization });
+				this._requestVisualizationEvent.fire({ visualization: arg.visualization });
 			}
 		} else if (hasCompare(arg)) {
 			const repoChanged = this._repository !== arg.repository;
 			this.repository = arg.repository;
 			const params: DidRequestOpenCompareModeParams = { repoPath: arg.repository.path, ...arg.compare };
-			// Cold show / repo swap / not-yet-ready must route through the state bootstrap (a bare
-			// notification would be wiped by `clearPendingIpcNotifications`); a warm same-repo show
-			// notifies directly. Mirrors the search path below and the `pendingAction` mechanism.
+			// Cold show / repo swap / not-yet-ready must route through the state bootstrap so the compare
+			// lands with the repo's own state instead of racing it; a warm same-repo show fires the
+			// navigation event directly. Mirrors the search path below and the `pendingAction` mechanism.
 			if (loading || repoChanged || !this.host.ready) {
 				this._pendingCompare = params;
 			} else {
-				void this.host.notify(DidRequestOpenCompareModeNotification, params);
+				this._requestOpenCompareModeEvent.fire(params);
 			}
 		} else if (hasRepository(arg)) {
 			const repoChanged = this._repository !== arg.repository;
@@ -1274,22 +1403,22 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 					if (this._data.session != null) {
 						// Synthetic WIP rows can't be paged in; selecting + notifying is enough.
 						if (isWipRowId(selectSha) || this._data.session.current.ids.has(selectSha)) {
-							void this.notifyDidChangeSelection();
+							this.notifyDidChangeSelection();
 						} else {
 							void this.revealRow(selectSha);
 						}
 					}
 				}
 				// Three cases routed through the state-bootstrap path (`_searchRequest` → `getState`):
-				//   1. Cold show (`loading`): webview isn't ready, a standalone notification would
-				//      queue in `_pendingIpcNotifications` and get wiped by the bootstrap
-				//      `clearPendingIpcNotifications()`.
+				//   1. Cold show (`loading`): the webview hasn't subscribed to the RPC services yet, so
+				//      firing `onDidRequestSearch` now would reach no subscriber and be lost — the state
+				//      bootstrap the client fetches on connect is the only channel guaranteed to reach it.
 				//   2. Repo swap (`repoChanged`): the repository setter triggers a full `updateState`
 				//      refetch anyway; pipe the search through it so it lands with the new repo's rows
 				//      instead of racing against the just-cleared graph session.
-				//   3. Force-refresh in flight (`!host.ready`): same wipe risk as #1 — the reconnect
-				//      handler clears pending notifications before flushing them.
-				// Otherwise (warm + same-repo + ready) use the lightweight notification — bypasses
+				//   3. Force-refresh in flight (`!host.ready`): same no-subscriber risk as #1 — the
+				//      reconnect hasn't re-subscribed the RPC services yet.
+				// Otherwise (warm + same-repo + ready) use the lightweight RPC event — bypasses
 				// the ~750ms `updateState` → `getState` pipeline since the only delta is the search.
 				// Mirrors the `DidRequestOpenCompareMode` / `DidRequestOpenTimelineScope` pattern.
 				if (loading || repoChanged || !this.host.ready) {
@@ -1302,7 +1431,7 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			if (loading) {
 				this._pendingSidebarPanel = arg.sidebarPanel;
 			} else {
-				void this.host.notify(DidRequestActiveSidebarPanelNotification, { panel: arg.sidebarPanel });
+				this._requestActiveSidebarPanelEvent.fire({ panel: arg.sidebarPanel });
 			}
 		} else if (hasAction(arg)) {
 			if (arg.action === 'scope-to-branch' && arg.target == null) {
@@ -1411,7 +1540,7 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 				// in (which carries the selection along).
 				if (!gateOnWipSelected && rowId != null && this._data.session != null) {
 					if (isWipRowId(rowId) || this._data.session.current.ids.has(rowId)) {
-						void this.notifyDidChangeSelection();
+						this.notifyDidChangeSelection();
 					} else {
 						void this.revealRow(rowId);
 					}
@@ -1433,7 +1562,7 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 						scopeOrigin: arg.scopeOrigin,
 					};
 				}
-				void this.host.notify(DidRequestGraphActionNotification, {
+				this._requestActionEvent.fire({
 					action: arg.action,
 					target: arg.target,
 					composeInstructions: arg.composeInstructions,
@@ -1527,6 +1656,12 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 	}
 
 	async includeBootstrap(_deferrable?: boolean): Promise<State> {
+		// The fresh bootstrap carries the complete state (branchState included), superseding any
+		// refresh deferred while hidden/not-ready — clear the flags so the next visibility restore
+		// doesn't fire a redundant rebuild (the legacy path's `clearPendingIpcNotifications` on
+		// reconnect did the equivalent).
+		this._pendingStateRefresh = false;
+		this._pendingBranchStateRefresh = false;
 		// Mark a state op as in-flight for the duration of the bootstrap so any `notifyDidChangeState`
 		// triggered by repo-change events during the bootstrap window waits on this op, then finds the
 		// state already fresh and skips the redundant getState/getGraph pipeline.
@@ -1740,6 +1875,10 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		void this.ensureAutoFetch();
 		if (focused) {
 			this._wip.recoverWorkingTreeStatsIfStuck();
+			// Regaining window focus is one of the edges a working-tree tick can have been deferred on —
+			// see `flushDeferredWorkingTree`. Nothing touches the RPC event buffer here (it tracks webview
+			// visibility, not window focus), so this re-produce is the only thing that lands.
+			this._wip.flushDeferredWorkingTree();
 			this._wip.recoverDeferredSecondaryWip();
 		}
 	}
@@ -1752,25 +1891,37 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 				// Re-push fresh WIP through the dedicated channel, which has the freshness (cache-invalidate),
 				// dedup, and commit/optimistic-edit guards `getState` lacks. Gated on `repositoryChanged`
 				// (working-tree edits bump the repo etag); the dedup gate no-ops this when nothing changed.
-				// (`updateState` no longer wipes the pending queue, but this fresher WIP still supersedes any
-				// stale queued push on success.)
+				// (`flushDeferredWorkingTree` below re-produces for the same reason when a tick was owed;
+				// the `_wipNotify` coalescer collapses the two into one read.)
 				if (repositoryChanged) {
 					void this._wip.notifyDidChangeWorkingTree();
 				}
-				// Flush the rest of the queue rather than letting the rebuild's `reset` drop it. The queue
-				// isn't limited to `_ipcNotificationMap` types that `getState` carries — `notify` re-queues
-				// any `queueable` type whose send failed, and some of those have no state representation at
-				// all (scope-anchor invalidation only clears the webview's merge-base cache from its own
-				// handler). Drop the queued full-state push, since the rebuild above supersedes it and
-				// replaying it would join the in-flight state notify and cost a second rebuild.
-				this.host.sendPendingIpcNotifications(DidChangeNotification);
+				// The rebuild above supersedes a deferred full-state refresh — drop it rather than also
+				// firing a now-redundant notify that would join the in-flight state notify and cost a
+				// second rebuild.
+				this._pendingStateRefresh = false;
+				// A deferred branch-state-only refresh is NOT superseded by the rebuild: the rebuild's own
+				// branchState can go stale between its build and its send (see `runStateNotify`'s
+				// revision-ordering strip), so the fast path still needs to run to land it.
+				if (this._pendingBranchStateRefresh) {
+					this._pendingBranchStateRefresh = false;
+					void this._producers.notifyDidChangeBranchStateOnly();
+				}
 			}
 		} else if (visible) {
-			this.host.sendPendingIpcNotifications();
+			if (this._pendingStateRefresh) {
+				this._pendingStateRefresh = false;
+				void this._data.notifyDidChangeState();
+			}
+			if (this._pendingBranchStateRefresh) {
+				this._pendingBranchStateRefresh = false;
+				void this._producers.notifyDidChangeBranchStateOnly();
+			}
 		}
 
-		// Flush any rows-plane state the publisher accumulated while hidden/not-ready (and recover a
-		// previously-broken send with a snapshot). Nothing is buffered, so nothing was lost.
+		// Flush any rows-plane state the publisher accumulated while hidden/not-ready. Nothing was ever
+		// buffered — the flush gate kept every send off the wire, so the channel consumed no seq and the
+		// receiver sees no gap; this ships one up-to-date delta (or snapshot) for the whole hidden window.
 		if (visible) {
 			void this._graphSync.flush();
 		}
@@ -1778,84 +1929,46 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		void this.ensureAutoFetch();
 		if (visible) {
 			this._wip.recoverWorkingTreeStatsIfStuck();
+			// Re-run the working-tree producer if a tick was owed while hidden. Deliberately a re-produce,
+			// not a replay: the `workingTreeChanged` event's buffer only holds the last PRE-hide read, which
+			// the user may have edited well past. Ordering is safe by construction — the controller flushes
+			// the event buffer BEFORE calling this hook (`onParentVisibilityChanged`), and this re-produce
+			// is a `git status` behind, so the fresh payload always lands last.
+			this._wip.flushDeferredWorkingTree();
 			this._wip.recoverDeferredSecondaryWip();
 		}
 	}
 
-	@ipcRequest(GetCountsRequest)
 	private onGetCounts() {
 		return this._data.onGetCounts();
 	}
 
-	@ipcRequest(GetOverviewRequest)
-	private onGetOverview(params: IpcParams<typeof GetOverviewRequest>): GraphOverviewData {
-		return this._panels.onGetOverview(params);
-	}
-
-	@ipcRequest(GetOverviewWipRequest)
-	private onGetOverviewWip(params: IpcParams<typeof GetOverviewWipRequest>): Promise<GetOverviewWipResponse> {
-		return this._panels.onGetOverviewWip(params);
-	}
-
-	@ipcRequest(GetOverviewWipDetailedRequest)
-	private onGetOverviewWipDetailed(
-		params: IpcParams<typeof GetOverviewWipDetailedRequest>,
-	): Promise<GetOverviewWipResponse> {
-		return this._panels.onGetOverviewWipDetailed(params);
-	}
-
-	@ipcRequest(GetOverviewEnrichmentRequest)
-	private onGetOverviewEnrichment(
-		params: IpcParams<typeof GetOverviewEnrichmentRequest>,
-	): Promise<GetOverviewEnrichmentResponse> {
-		return this._panels.onGetOverviewEnrichment(params);
-	}
-
-	@ipcRequest(GetAgentSessionsRequest)
-	private onGetAgentSessions(): AgentSessionState[] {
-		return this._panels.onGetAgentSessions();
-	}
-
-	private onAgentSessionsChanged(sessions: AgentSessionState[]): void {
-		void this.notifyDidChangeAgentSessions(sessions);
-
+	private onAgentSessionsChanged(_sessions: AgentSessionState[]): void {
 		// Agent membership drives the `agents` branches-visibility ref set, so any change to
 		// the live session list needs to recompute the included refs and push a fresh
-		// visibility notification to the webview.
+		// filters snapshot to the webview.
 		const repoPath = this.repository?.path ?? this._data.session?.repoPath;
 		if (this.getBranchesVisibility(this.getFiltersByRepo(repoPath)) === 'agents') {
-			void this.notifyDidChangeRefsVisibility();
+			void this.fireFiltersChanged();
 		}
 	}
 
-	/** Re-reads the live sessions rather than taking a captured array, so a queued replay ships current
-	 *  state instead of whatever was live when the hook fired. */
-	private async notifyDidChangeAgentSessions(sessions?: AgentSessionState[]): Promise<boolean> {
-		if (!this.host.ready || !this.host.visible) {
-			this.host.addPendingIpcNotification(DidChangeAgentSessionsNotification, this._ipcNotificationMap, this);
-			Logger.debug(
-				`GraphWebviewProvider.notifyDidChangeAgentSessions: queued as pending (ready=${this.host.ready}, visible=${this.host.visible})`,
-			);
-			return false;
-		}
-
-		return this.host.notify(DidChangeAgentSessionsNotification, {
-			sessions: sessions ?? this.container.agentStatus?.getSerializedSessions() ?? [],
-		});
-	}
-
-	@ipcRequest(GetWipStatsRequest)
-	private async onGetWipStats(params: IpcParams<typeof GetWipStatsRequest>): Promise<GetWipStatsResponse> {
+	private async onGetWipStats(
+		shas: string[],
+		options?: { force?: boolean },
+		signal?: AbortSignal,
+	): Promise<GetWipStatsResponse> {
 		const response: GetWipStatsResponse = {};
-		if (params.shas.length === 0) return response;
+		if (shas.length === 0) return response;
 
 		let cancellation: CancellationTokenSource | undefined;
+		let onAbort: (() => void) | undefined;
 		try {
 			// When the user has disabled per-worktree WIP stats, short-circuit the graph-triggered
 			// missing-stats calls. The graph's visible-scan dedup never re-asks for an unchanged
 			// missing set, so leaving `workDirStats` undefined keeps the stats pill hidden.
 			// Selection-driven fetches pass `force: true` to bypass the gate.
-			if (!params.force && !configuration.get('graph.showWorktreeWipStats')) {
+			if (!options?.force && !configuration.get('graph.showWorktreeWipStats')) {
 				return response;
 			}
 
@@ -1867,11 +1980,21 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			// answers (`claimWipStatsRequest`) rather than either killing the other. Dispose cancels all.
 			const source = (cancellation = new CancellationTokenSource());
 			this._wipStatsCancellations.add(source);
-			const signal = toAbortSignal(source.token);
+
+			onAbort = () => source.cancel();
+			if (signal?.aborted) {
+				// Already aborted (e.g. a signal born aborted from wire deserialization) never fires
+				// its own `abort` event — `addEventListener` alone would miss it.
+				onAbort();
+			} else {
+				signal?.addEventListener('abort', onAbort, { once: true });
+			}
+
+			const batchSignal = toAbortSignal(source.token);
 			const primaryRepoPath = this.repository?.path ?? this._data.session?.repoPath;
 
 			await Promise.allSettled(
-				params.shas.map(async sha => {
+				shas.map(async sha => {
 					// Peer worktrees only — the graph's own worktree's status group rides the working-tree
 					// push channel, which is authoritative and would be clobbered by an on-demand read.
 					const path = getWipRowWorktreePath(sha);
@@ -1884,10 +2007,10 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 					// cherry-pick) the primary's action bar does. `pausedOps` is optional on the
 					// service surface; older providers may not implement it.
 					const [statusResult, pausedOpResult] = await Promise.allSettled([
-						this._wip.getStatusFromCache(path, signal),
+						this._wip.getStatusFromCache(path, batchSignal),
 						// `force` so a missed `'pausedOp'` FS-watcher tick on this secondary worktree
 						// can't leave the WIP row stuck on a stale in-progress indicator.
-						svc.pausedOps?.getPausedOperationStatus?.({ force: true }, signal),
+						svc.pausedOps?.getPausedOperationStatus?.({ force: true }, batchSignal),
 					]);
 					if (source.token.isCancellationRequested) return;
 
@@ -1923,12 +2046,15 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 				this._wipStatsCancellations.delete(cancellation);
 				cancellation.dispose();
 			}
+			if (onAbort != null) {
+				signal?.removeEventListener('abort', onAbort);
+			}
 		}
 	}
 
-	@ipcRequest(GetWipLineStatsRequest)
 	private async onGetWipLineStats(
-		params: IpcParams<typeof GetWipLineStatsRequest>,
+		repoPath: string,
+		signal?: AbortSignal,
 	): Promise<GetWipLineStatsResponse | undefined> {
 		// Per-file line stats aren't carried by the every-tick `wip` push (`git status` can't emit
 		// them); the webview requests them lazily only while the WIP file list is visible, so one
@@ -1937,9 +2063,11 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		// by status content, pure line edits (same status) don't refresh these until a status change /
 		// re-select / refresh — see `updateWipFileStats`. Per-save freshness would need host-driven
 		// pushes on each working-tree tick while the panel is open.
+		signal?.throwIfAborted();
 		try {
-			const svc = this.container.git.getRepositoryService(params.repoPath);
+			const svc = this.container.git.getRepositoryService(repoPath);
 			const files = await svc.diff.getDiffStatus('HEAD', undefined, { includeUntracked: true });
+			signal?.throwIfAborted();
 			if (files == null) return undefined;
 
 			// Key by normalized repo-relative path so the webview can match its `wip.changes.files`
@@ -1956,6 +2084,8 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			}
 			return response;
 		} catch (ex) {
+			if (isCancellationError(ex)) throw ex;
+
 			Logger.error(ex, 'GraphWebviewProvider', 'onGetWipLineStats');
 			return undefined;
 		}
@@ -2046,27 +2176,32 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		}
 	}
 
-	@ipcCommand(UpdateGraphConfigurationCommand)
-	private onUpdateGraphConfig(params: IpcParams<typeof UpdateGraphConfigurationCommand>) {
+	/** Persists `changes` to the underlying settings and resolves once every write has landed —
+	 *  the RPC promise's completion signal. The new config itself arrives separately, via the
+	 *  config watcher (`onConfigurationChanged`) firing `notifyDidChangeConfiguration` once it
+	 *  observes the write. */
+	private async updateGraphConfig(changes: Partial<GraphComponentConfig>): Promise<void> {
 		const config = this.getComponentConfig();
 
-		let key: keyof IpcParams<typeof UpdateGraphConfigurationCommand>['changes'];
-		for (key in params.changes) {
-			if (config[key] !== params.changes[key]) {
+		const pending: Thenable<void>[] = [];
+
+		let key: keyof Partial<GraphComponentConfig>;
+		for (key in changes) {
+			if (config[key] !== changes[key]) {
 				switch (key) {
 					case 'autoFetchEnabled':
-						void configuration.updateEffective('graph.autoFetch.enabled', params.changes[key]);
+						pending.push(configuration.updateEffective('graph.autoFetch.enabled', changes[key]));
 						break;
 					case 'minimapDataType':
-						void configuration.updateEffective('graph.minimap.dataType', params.changes[key]);
+						pending.push(configuration.updateEffective('graph.minimap.dataType', changes[key]));
 						break;
 					case 'minimapReversed':
-						void configuration.updateEffective('graph.minimap.reversed', params.changes[key]);
+						pending.push(configuration.updateEffective('graph.minimap.reversed', changes[key]));
 						break;
 					case 'minimapMarkerTypes': {
 						const additionalTypes: GraphMinimapMarkersAdditionalTypes[] = [];
 
-						const markers = params.changes[key] ?? [];
+						const markers = changes[key] ?? [];
 						for (const marker of markers) {
 							switch (marker) {
 								case 'localBranches':
@@ -2079,44 +2214,48 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 									break;
 							}
 						}
-						void configuration.updateEffective('graph.minimap.additionalTypes', additionalTypes);
+						pending.push(configuration.updateEffective('graph.minimap.additionalTypes', additionalTypes));
 						break;
 					}
 					case 'dimMergeCommits':
-						void configuration.updateEffective('graph.dimMergeCommits', params.changes[key]);
+						pending.push(configuration.updateEffective('graph.dimMergeCommits', changes[key]));
 						break;
 					case 'onlyFollowFirstParent':
-						void configuration.updateEffective('graph.onlyFollowFirstParent', params.changes[key]);
+						pending.push(configuration.updateEffective('graph.onlyFollowFirstParent', changes[key]));
 						break;
 					case 'detailsLocation': {
 						// Persist 'auto' explicitly — `updateEffective` clears a value equal to the
 						// default, and an unset `graph.details.location` re-triggers the first-time
 						// (hidden details) experience. Window-scoped setting, so only user/workspace
 						// can hold a value.
-						const value = params.changes[key];
+						const value = changes[key];
 						if (value === 'auto') {
-							void configuration.update(
-								'graph.details.location',
-								value,
-								configuration.inspect('graph.details.location')?.workspaceValue !== undefined
-									? ConfigurationTarget.Workspace
-									: ConfigurationTarget.Global,
+							pending.push(
+								configuration.update(
+									'graph.details.location',
+									value,
+									configuration.inspect('graph.details.location')?.workspaceValue !== undefined
+										? ConfigurationTarget.Workspace
+										: ConfigurationTarget.Global,
+								),
 							);
 						} else {
-							void configuration.updateEffective('graph.details.location', value);
+							pending.push(configuration.updateEffective('graph.details.location', value));
 						}
 						break;
 					}
 					case 'sidebarPinned':
-						void configuration.updateEffective('graph.sidebar.pinned', params.changes[key]);
+						pending.push(configuration.updateEffective('graph.sidebar.pinned', changes[key]));
 						break;
 					case 'style':
-						void configuration.updateEffective('graph.style', params.changes[key]);
+						pending.push(configuration.updateEffective('graph.style', changes[key]));
 						break;
 					case 'activityDecay':
-						void configuration.updateEffective(
-							'graph.experimental.visualizations.activityDecay',
-							params.changes[key],
+						pending.push(
+							configuration.updateEffective(
+								'graph.experimental.visualizations.activityDecay',
+								changes[key],
+							),
 						);
 						break;
 					default:
@@ -2125,6 +2264,10 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 						break;
 				}
 			}
+		}
+
+		if (pending.length) {
+			await Promise.all(pending);
 		}
 	}
 
@@ -2148,22 +2291,21 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			}
 		}
 
-		// `graph.lanes.density` drives BOTH the lane spacing (via the config re-send in the `graph`
-		// catch-all below) AND the column-menu context (`lanes:density:*`, which the Expanded/Compact
-		// menu items toggle on). Refresh the column context too — otherwise the menu item is one-way: the
-		// spacing changes but the item's `when` clause never flips to offer the opposite.
-		// The Changes column mode is a real setting overlaid into column config (see `getColumnSettings`) —
-		// a settings.json edit isn't part of the component-config catch-all, so push a columns update so the
-		// column (and the picker's current-mode highlight) re-render live.
-		if (configuration.changed(e, ['graph.lanes.density', 'graph.changesColumn.mode'])) {
-			void this.notifyDidChangeColumns();
-		}
-
-		// Same one-way-menu problem as `graph.lanes.density` above: the marker-toggle context items are
-		// only emitted while `enabled` is on, so flipping it from the settings page (not via a toggle
-		// command, which refreshes on its own) would leave the gear submenu and the rail menu empty.
-		if (configuration.changed(e, 'graph.scrollMarkers.enabled')) {
-			void this.notifyDidChangeScrollMarkers();
+		// Settings that feed the columns plane's snapshot rather than (or as well as) the component config:
+		// - `graph.lanes.density` drives BOTH the lane spacing (via the config re-send in the `graph`
+		//   catch-all below) AND the column-menu context (`lanes:density:*`, which the Expanded/Compact menu
+		//   items toggle on). Without the columns push the menu item is one-way: the spacing changes but the
+		//   item's `when` clause never flips to offer the opposite.
+		// - The Changes column mode is a real setting overlaid into column config (see `getColumnSettings`) —
+		//   a settings.json edit isn't part of the component-config catch-all, so the column (and the picker's
+		//   current-mode highlight) would only re-render on the next reload.
+		// - `graph.scrollMarkers.enabled`: the marker-toggle context items are only emitted while it's on, so
+		//   flipping it from the settings page (not via a toggle command, which refreshes on its own) would
+		//   leave the gear submenu and the rail menu empty.
+		if (
+			configuration.changed(e, ['graph.lanes.density', 'graph.changesColumn.mode', 'graph.scrollMarkers.enabled'])
+		) {
+			this.fireColumnsChanged();
 		}
 
 		// The worktree clean/dirty probe only feeds the overview bar, so it's skipped while the bar is
@@ -2198,11 +2340,10 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		// metadata don't needlessly re-fetch and flicker on the toggle.
 		if (configuration.changed(e, 'graph.showUpstreamStatus') && this._producers.refsMetadata == null) {
 			this._producers.resetRefsMetadata();
-			// REPLACE the webview's refsMetadata map (the reset-anchor) over the sequenced channel — a
-			// same-enabled wipe/enable the spread-merge delta can't express. Keep `updateState(true)` too:
-			// the State push carries the map as reset-anchor. Reuses the loaded graph (etag unchanged), no re-walk.
-			this._graphSync.markRefsMetadataReset();
-			void this._graphSync.flush();
+			// REPLACE the webview's refsMetadata map over the reset event — a same-enabled wipe/enable.
+			// Keep `updateState(true)` for the rest of the config-derived state; it reuses the loaded graph
+			// (etag unchanged), so no re-walk.
+			this._producers.fireRefsMetadataChanged();
 			this._data.updateState(true);
 		}
 
@@ -2237,7 +2378,7 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			configuration.changed(e, 'gitOptimizations.enabled') ||
 			configuration.changed(e, 'graph')
 		) {
-			void this.notifyDidChangeConfiguration();
+			this.notifyDidChangeConfiguration();
 
 			if (
 				configuration.changed(e, 'defaultCurrentUserNameStyle') ||
@@ -2264,18 +2405,8 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 
 		if (!e.affectsConfiguration('git.autofetch') && !e.affectsConfiguration('git.autofetchPeriod')) return;
 
-		void this.notifyDidChangeConfiguration();
+		this.notifyDidChangeConfiguration();
 		void this.ensureAutoFetch();
-	}
-
-	@trace({ args: false })
-	private onContextChanged(key: keyof ContextKeys) {
-		if (['gitlens:gk:organization:ai:enabled', 'gitlens:gk:organization:drafts:enabled'].includes(key)) {
-			this.notifyDidChangeOrgSettings();
-		}
-		if (key === 'gitlens:agents:enabled') {
-			void this.notifyDidChangeCanInstallHooks();
-		}
 	}
 
 	@trace({ args: false })
@@ -2293,7 +2424,23 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			// Push the latest scoped draft map to this webview so a concurrent provider's write
 			// (other graph instance, host-initiated undo from a different webview) lands here
 			// without waiting for the next full state push.
-			void this._wip.notifyDidChangeWipDrafts();
+			this._wip.notifyDidChangeWipDrafts();
+		}
+
+		if (e.keys.includes('graph:filtersByRepo')) {
+			// Filters are per-repo but each provider only pushed its OWN writes — so a second graph (editor
+			// tab + sidebar view) never learned about the other's hide/pin/visibility change. Storage fires
+			// in-process for every provider, including the writer, whose own write also fires: the extra
+			// emission is a duplicate of the identical complete snapshot, so it's idempotent.
+			void this.fireFiltersChanged();
+		}
+
+		if (e.keys.includes('graph:columns')) {
+			// Columns are workspace-wide, but each provider only pushed its OWN writes — so a second graph
+			// (editor tab + sidebar view) never learned about the other's resize/hide/group. Storage fires
+			// in-process for every provider, including the writer, whose own `updateColumns` also fires:
+			// the extra emission is a duplicate of the identical complete snapshot, so it's idempotent.
+			this.fireColumnsChanged();
 		}
 	}
 
@@ -2314,18 +2461,11 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		return configuration.get('graph.minimap.dataType') === 'lines' && this.isMinimapVisible();
 	}
 
-	private getOrgSettings(): State['orgSettings'] {
-		return {
-			ai: getContext('gitlens:gk:organization:ai:enabled', true),
-			drafts: getContext('gitlens:gk:organization:drafts:enabled', false),
-		};
-	}
-
 	@trace({ args: false })
 	private onFeaturePreviewChanged(e: FeaturePreviewChangeEvent) {
 		if (e.feature !== 'graph') return;
 
-		void this.notifyDidStartFeaturePreview(e);
+		void this.fireAccessChanged(e);
 	}
 
 	private getFeaturePreview(): FeaturePreview {
@@ -2423,8 +2563,9 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 
 		// Fast-path: refresh branchState immediately so push/pull/fetch ahead/behind land in the
 		// header without waiting for the full graph rebuild. The full state pipeline re-sends
-		// branchState; the webview dedups equal values (see `DidChangeNotification` in
-		// stateProvider.ts), so the worst case is a redundant IPC discarded on receipt.
+		// branchState; the webview dedups equal values (see the `branchState` guard in
+		// stateProvider.ts's `state.onStateChanged` handler), so the worst case is a redundant push
+		// discarded on receipt.
 		if (e.changed('head', 'heads', 'remotes')) {
 			void this._producers.notifyDidChangeBranchStateOnly();
 		}
@@ -2486,68 +2627,7 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			return;
 		}
 
-		void this.notifyDidChangeSubscription();
-	}
-
-	private onOnboardingChanged(e: OnboardingChangeEvent) {
-		if (e.key === 'agents:banner') {
-			this.onAgentsBannerChanged();
-		} else if (e.key === 'graph-walkthrough:banner') {
-			this.onGraphWalkthroughBannerChanged();
-		} else if (e.key === 'graph:layoutPrompt') {
-			this.onLayoutPromptChanged();
-		}
-	}
-
-	private onAgentsBannerChanged() {
-		if (!this.host.visible) return;
-
-		void this.host.notify(DidChangeAgentsBanner, this.getAgentsBannerCollapsed());
-	}
-
-	private getAgentsBannerCollapsed() {
-		return !isAgentsBannerEnabled(this.container);
-	}
-
-	@ipcCommand(TrackGraphOverviewShownCommand)
-	private onTrackGraphOverviewShown() {
-		void this.container.usage.track('action:gitlens.graph.overview.shown:happened');
-	}
-
-	@ipcCommand(TrackGraphScopeChangedCommand)
-	private onTrackGraphScopeChanged() {
-		void this.container.usage.track('action:gitlens.graph.scope.changed:happened');
-	}
-
-	@ipcCommand(TrackGraphDetailsReviewModeCommand)
-	private onTrackGraphDetailsReviewMode() {
-		void this.container.usage.track('action:gitlens.graph.details.reviewMode:happened');
-	}
-
-	@ipcCommand(TrackGraphDetailsComposeModeCommand)
-	private onTrackGraphDetailsComposeMode() {
-		void this.container.usage.track('action:gitlens.graph.details.composeMode:happened');
-	}
-
-	@ipcCommand(TrackGraphDetailsResolveModeCommand)
-	private onTrackGraphDetailsResolveMode() {
-		void this.container.usage.track('action:gitlens.graph.details.resolveMode:happened');
-	}
-
-	@ipcCommand(TrackGraphDetailsCompareModeCommand)
-	private onTrackGraphDetailsCompareMode() {
-		void this.container.usage.track('action:gitlens.graph.details.compareMode:happened');
-	}
-
-	@ipcCommand(TrackGraphDetailsWipShownCommand)
-	private onTrackGraphDetailsWipShown() {
-		void this.container.usage.track('action:gitlens.graph.details.wipShown:happened');
-	}
-
-	private onGraphWalkthroughBannerChanged() {
-		if (!this.host.visible) return;
-
-		void this.host.notify(DidChangeGraphWalkthroughBanner, this.getGraphWalkthroughBannerState());
+		void this.fireAccessChanged();
 	}
 
 	/** One-time nudge for the #5545 move of the Graph into the side bar — assumes the side bar stays
@@ -2555,12 +2635,6 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 	 *  bar/panel host) — the editor tab has no side-vs-bottom placement to choose. */
 	private getLayoutPromptNeeded(): boolean {
 		return this.host.is('view') && !this.container.onboarding.isDismissed('graph:layoutPrompt');
-	}
-
-	private onLayoutPromptChanged() {
-		if (!this.host.visible) return;
-
-		void this.host.notify(DidChangeLayoutPromptNotification, this.getLayoutPromptNeeded());
 	}
 
 	/** RPC handler for the whole welcome-continue interaction — see docs/webview-architecture.md
@@ -2621,38 +2695,6 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		void executeCoreCommand('gitlens.views.graph.focus');
 	}
 
-	private onGraphWalkthroughProgressChanged() {
-		if (!this.host.visible) return;
-
-		void this.host.notify(DidChangeGraphWalkthroughComplete, this.getGraphWalkthroughComplete());
-	}
-
-	private onUsageChanged(e: UsageChangeEvent | undefined) {
-		if (e?.key === 'action:gitlens.graph.walkthrough.started:happened') {
-			this.onGraphWalkthroughStartedChanged();
-		}
-	}
-
-	private onGraphWalkthroughStartedChanged() {
-		if (!this.host.visible) return;
-
-		void this.host.notify(DidChangeGraphWalkthroughStarted, this.getGraphWalkthroughStarted());
-	}
-
-	private getGraphWalkthroughBannerState(): GraphWalkthroughBannerState {
-		return {
-			dismissed: this.container.onboarding.isDismissed('graph-walkthrough:banner'),
-		};
-	}
-
-	private getGraphWalkthroughComplete() {
-		return this.container.walkthrough.graphDoneCount >= this.container.walkthrough.graphWalkthroughSize;
-	}
-
-	private getGraphWalkthroughStarted() {
-		return this.container.usage.isUsed('action:gitlens.graph.walkthrough.started:happened');
-	}
-
 	private onThemeChanged(theme: ColorTheme) {
 		if (
 			this._theme != null &&
@@ -2665,16 +2707,14 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		this._data.updateState();
 	}
 
-	@ipcCommand(UpdateColumnsCommand)
-	private onColumnsChanged(params: IpcParams<typeof UpdateColumnsCommand>) {
-		// Ack the webview's write counter — every later columns push carries it so the webview can drop
-		// pushes generated before this write (see DidChangeColumnsParams.columnsRevision).
-		this._columnsRevision = params.revision ?? this._columnsRevision;
-		this.updateColumns(params.config, { keepStoredModes: true });
+	/** The webview's columns write. Resolves only once the storage write has landed and the columns
+	 *  event has fired, so the caller can treat resolution as "my write is no longer outstanding". */
+	private async setColumns(config: GraphColumnsConfig): Promise<void> {
+		await this.updateColumns(config, { keepStoredModes: true });
 
 		const eventData: WebviewTelemetryEvents['graph/columns/changed'] = {};
-		for (const [name, config] of Object.entries(params.config)) {
-			for (const [prop, value] of Object.entries(config)) {
+		for (const [name, cfg] of Object.entries(config)) {
+			for (const [prop, value] of Object.entries(cfg)) {
 				eventData[`column.${name}.${prop as keyof GraphColumnConfig}`] = value;
 			}
 		}
@@ -2684,110 +2724,103 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 	// The Changes mode picker's pick. Changes' mode is a real setting (single source of truth): write it
 	// effectively so a settings.json round-trip works both directions. Other columns' modes stay in storage
 	// (only the graph column's compact toggle uses that path). Mode is still never webview-authored via
-	// `updateColumns` — this dedicated command is the only mode write path from the webview.
-	@ipcCommand(UpdateColumnModeCommand)
-	private onColumnModeChanged(params: IpcParams<typeof UpdateColumnModeCommand>) {
-		if (params.name !== 'changes') return;
+	// `updateColumns` — this is the only mode write path from the webview. The new mode echoes back through
+	// the settings watcher (`onConfigurationChanged` → `fireColumnsChanged`), not from here.
+	private async updateColumnMode(name: GraphColumnName, mode: ColumnMode | undefined): Promise<void> {
+		if (name !== 'changes') return;
 
-		void configuration.updateEffective('graph.changesColumn.mode', changesModeOrDefault(params.mode));
+		await configuration.updateEffective('graph.changesColumn.mode', changesModeOrDefault(mode));
 	}
 
-	@ipcCommand(EnableChangesColumnCommand)
-	private onEnableChangesColumn(): void {
-		void configuration.updateEffective('graph.changesColumn.enabled', true);
+	/** The dormant Changes column's one-time stats consent. The echo is cross-plane: `graph.changesColumn.enabled`
+	 *  feeds the component config, so it arrives over `configuration.onDidChange`, not the columns event. */
+	private async enableChangesColumn(): Promise<void> {
+		await configuration.updateEffective('graph.changesColumn.enabled', true);
 	}
 
-	@ipcCommand(UpdateGraphDisplayModeCommand)
-	private onDisplayModeChanged(params: IpcParams<typeof UpdateGraphDisplayModeCommand>) {
-		if (this._displayMode === params.mode) return;
+	private async setDisplayMode(mode: GraphDisplayMode): Promise<void> {
+		if (this._displayMode === mode) return;
 
-		this._displayMode = params.mode;
+		this._displayMode = mode;
 
 		// Visualizations (Visual History) needs row stats — refetch if the current graph was loaded without them.
-		if (params.mode === 'visualizations' && !this._data.session?.current.includes?.stats) {
+		if (mode === 'visualizations' && !this._data.session?.current.includes?.stats) {
 			// Flip the loading flag eagerly so the timeline shows its overlay during the refetch (the
 			// stats-including rebuild hasn't landed, so `rowsStatsDeferred` can't report loading yet). Cleared
 			// in `setGraph` when the stats graph lands; shipped over the rowsStats channel (no dual writer).
 			this._data.rowsStatsLoadingOverride = true;
 			this._graphSync.mark('rowsStats');
-			void this._graphSync.flush();
+			await this._graphSync.flush();
 			this._data.updateState();
-		} else if (params.mode !== 'visualizations' && this._data.rowsStatsLoadingOverride) {
+		} else if (mode !== 'visualizations' && this._data.rowsStatsLoadingOverride) {
 			// Left Visualizations before the stats rebuild landed — clear the eager override (else the
 			// stats-loading spinner sticks forever) and ship the cleared flag over the rowsStats channel.
 			this._data.rowsStatsLoadingOverride = false;
 			this._graphSync.mark('rowsStats');
-			void this._graphSync.flush();
+			await this._graphSync.flush();
 		}
 	}
 
-	@ipcCommand(UpdateRefsVisibilityCommand)
-	private onRefsVisibilityChanged(params: IpcParams<typeof UpdateRefsVisibilityCommand>) {
-		this.updateExcludedRefs(this._data.session?.repoPath, params.refs, params.visible);
-	}
+	/** Ref pill double-click (row double-click is a no-op — the app handles it locally). */
+	private async handleRefDoubleClick(ref: GraphRef, metadata?: GraphRefMetadataItem): Promise<void> {
+		if (!ref.context) return;
 
-	@ipcCommand(UpdatePinnedRefCommand)
-	private onPinnedRefChanged(params: IpcParams<typeof UpdatePinnedRefCommand>) {
-		this.updatePinnedRef(this._data.session?.repoPath, params.ref);
-	}
+		let item = this.getGraphItemContext(ref.context);
+		if (!isGraphItemRefContext(item)) return;
 
-	@ipcCommand(DoubleClickedCommand)
-	private onDoubleClick(params: IpcParams<typeof DoubleClickedCommand>) {
-		if (params.type === 'ref' && params.ref.context) {
-			let item = this.getGraphItemContext(params.ref.context);
-			if (isGraphItemRefContext(item)) {
-				if (params.metadata != null) {
-					item = this.getGraphItemContext(params.metadata.data.context);
-					if (params.metadata.type === 'upstream' && isGraphItemTypedContext(item, 'upstreamStatus')) {
-						const { ahead, behind, ref } = item.webviewItemValue;
-						if (behind > 0) {
-							return void RepoActions.pull(ref.repoPath, ref);
-						}
-						if (ahead > 0) {
-							return void RepoActions.push(ref.repoPath, false, ref);
-						}
-					} else if (params.metadata.type === 'pullRequest' && isGraphItemTypedContext(item, 'pullrequest')) {
-						return void this._commands.openPullRequestOnRemote(item);
-					} else if (params.metadata.type === 'issue' && isGraphItemTypedContext(item, 'issue')) {
-						return void this.openIssueOnRemote(item);
-					}
-
+		if (metadata != null) {
+			item = this.getGraphItemContext(metadata.data.context);
+			if (metadata.type === 'upstream' && isGraphItemTypedContext(item, 'upstreamStatus')) {
+				const { ahead, behind, ref: itemRef } = item.webviewItemValue;
+				if (behind > 0) {
+					await RepoActions.pull(itemRef.repoPath, itemRef);
 					return;
 				}
-
-				const { ref } = item.webviewItemValue;
-				if (params.ref.refType === 'head' && params.ref.isCurrentHead) {
-					return RepoActions.switchTo(ref.repoPath);
+				if (ahead > 0) {
+					await RepoActions.push(itemRef.repoPath, false, itemRef);
+					return;
 				}
-
-				// Override the default confirmation if the setting is unset
-				return RepoActions.switchTo(
-					ref.repoPath,
-					ref,
-					configuration.isUnset('gitCommands.skipConfirmations') ? true : undefined,
-				);
+			} else if (metadata.type === 'pullRequest' && isGraphItemTypedContext(item, 'pullrequest')) {
+				await this._commands.openPullRequestOnRemote(item);
+				return;
+			} else if (metadata.type === 'issue' && isGraphItemTypedContext(item, 'issue')) {
+				await this.openIssueOnRemote(item);
+				return;
 			}
+
+			return;
 		}
 
-		return Promise.resolve();
+		const { ref: itemRef } = item.webviewItemValue;
+		if (ref.refType === 'head' && ref.isCurrentHead) {
+			await RepoActions.switchTo(itemRef.repoPath);
+			return;
+		}
+
+		// Override the default confirmation if the setting is unset
+		await RepoActions.switchTo(
+			itemRef.repoPath,
+			itemRef,
+			configuration.isUnset('gitCommands.skipConfirmations') ? true : undefined,
+		);
 	}
 
-	@ipcRequest(MergePullRequestRequest)
-	private async onMergePullRequest(
-		params: IpcParams<typeof MergePullRequestRequest>,
-	): Promise<IpcResponse<typeof MergePullRequestRequest>> {
-		const resolved = await this._panels.resolvePullRequestForMerge(params.number);
+	private async mergePullRequest(
+		number: string,
+		options?: { confirmed?: boolean; mergeMethod?: 'merge' | 'squash' | 'rebase' },
+	): Promise<MergePullRequestResult> {
+		const resolved = await this._panels.resolvePullRequestForMerge(number);
 		if (resolved == null) {
-			void window.showErrorMessage(`Unable to resolve pull request #${params.number}`);
+			void window.showErrorMessage(`Unable to resolve pull request #${number}`);
 			return { merged: false };
 		}
 
 		const { integration, pr } = resolved;
 		// A sheet-side confirmation already named the blast radius in place; only unconfirmed callers
 		// (e.g. the branch sheet's chip) get the quick pick.
-		if (!params.confirmed && !(await confirmPullRequestMerge(pr))) return { merged: false };
+		if (!options?.confirmed && !(await confirmPullRequestMerge(pr))) return { merged: false };
 
-		const mergeMethod = params.mergeMethod != null ? mergeMethodsByName[params.mergeMethod] : undefined;
+		const mergeMethod = options?.mergeMethod != null ? mergeMethodsByName[options.mergeMethod] : undefined;
 
 		const result = await mergePullRequestWithProgress(
 			integration,
@@ -2821,13 +2854,13 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 	 *  panel, and branch overview chips all re-fetch in place. */
 	private refreshAfterPullRequestMerge(): void {
 		this._producers.resetRefsMetadata();
-		this._graphSync.markRefsMetadataReset();
+		this._producers.fireRefsMetadataChanged();
 		this._panels.notifySidebarInvalidated();
-		void this._panels.notifyDidChangeOverview();
+		this._panels.notifyDidChangeOverview();
 		this._data.updateState(true);
 	}
 
-	// Not a registered command — invoked only by `onDoubleClick` for issue ref-metadata badges.
+	// Not a registered command — invoked only by `handleRefDoubleClick` for issue ref-metadata badges.
 	@debug()
 	private openIssueOnRemote(item?: GraphItemContext): Promise<void> {
 		if (isGraphItemTypedContext(item, 'issue')) {
@@ -2840,32 +2873,46 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		return Promise.resolve();
 	}
 
-	@ipcRequest(GetRowHoverRequest)
-	private async onHoverRowRequest(params: IpcParams<typeof GetRowHoverRequest>) {
-		const hover: IpcResponse<typeof GetRowHoverRequest> = {
-			id: params.id,
+	/**
+	 * Row hover markdown. Single-flight via `cancelOperation('hover')`/`createCancellation('hover')` —
+	 * a newer call always supersedes an outstanding one. `signal` bridges a superseded/torn-down RPC
+	 * call into the same per-call cancellation token; `cancelOperation('hover')` above is the fallback
+	 * for two concurrent hovers that arrive without a signal. Never rejects — a rejected RPC promise
+	 * would leave the hover card waiting instead of falling back (see the outer catch).
+	 */
+	private async getRowHover(type: GitGraphRowKind, id: string, signal?: AbortSignal): Promise<DidGetRowHoverParams> {
+		const hover: DidGetRowHoverParams = {
+			id: id,
 			markdown: undefined!,
 		};
 
 		this.cancelOperation('hover');
 
+		let onAbort: (() => void) | undefined;
+
 		try {
 			if (this._data.session != null) {
-				const id = params.id;
-
 				let markdown = this._hoverCache.get(id);
 				if (markdown == null) {
 					const cancellation = this.createCancellation('hover');
+					onAbort = () => cancellation.cancel();
+					if (signal?.aborted) {
+						// Already aborted (e.g. a signal born aborted from wire deserialization) never fires
+						// its own `abort` event — `addEventListener` alone would miss it.
+						onAbort();
+					} else {
+						signal?.addEventListener('abort', onAbort, { once: true });
+					}
 
 					let cache = true;
 					let commit;
 					try {
-						const wipWorktreePath = params.type === 'workdir' ? getWipRowWorktreePath(id) : undefined;
+						const wipWorktreePath = type === 'workdir' ? getWipRowWorktreePath(id) : undefined;
 						const isSecondaryWip =
 							wipWorktreePath != null && wipWorktreePath !== this._data.session.repoPath;
 						const hoverRepoPath = isSecondaryWip ? wipWorktreePath : this._data.session.repoPath;
 						const svc = this.container.git.getRepositoryService(hoverRepoPath);
-						switch (params.type) {
+						switch (type) {
 							case 'workdir':
 								cache = false;
 								// The uncommitted pseudo-commit's `repoPath` carries the worktree path the
@@ -2874,11 +2921,11 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 								break;
 							case 'stash': {
 								const stash = await svc.stash?.getStash(undefined, toAbortSignal(cancellation.token));
-								commit = stash?.stashes.get(params.id);
+								commit = stash?.stashes.get(id);
 								break;
 							}
 							default: {
-								commit = await svc.commits.getCommit(params.id, toAbortSignal(cancellation.token));
+								commit = await svc.commits.getCommit(id, toAbortSignal(cancellation.token));
 								break;
 							}
 						}
@@ -2926,14 +2973,18 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			hover.markdown ??= { status: 'rejected' as const, reason: new CancellationError() };
 			return hover;
 		} catch (ex) {
-			Logger.error(ex, 'GraphWebviewProvider', 'onHoverRowRequest');
-			// Return a structurally-valid response so the webview's `getResponsePromise` resolves
-			// in milliseconds (not the 5-min timeout) and the hover render can show a fallback.
+			Logger.error(ex, 'GraphWebviewProvider', 'getRowHover');
+			// Return a structurally-valid response so the app's `getResponsePromise`/RPC call resolves
+			// quickly (not a 5-min timeout) and the hover render can show a fallback.
 			return {
-				id: params.id,
+				id: id,
 				markdown: { status: 'rejected' as const, reason: ex },
 				error: ex instanceof Error ? ex.message : String(ex),
 			};
+		} finally {
+			if (onAbort != null) {
+				signal?.removeEventListener('abort', onAbort);
+			}
 		}
 	}
 
@@ -3004,53 +3055,55 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		);
 	}
 
-	@ipcCommand(CancelLoadRowCommand)
-	private onCancelLoadRow(params: IpcParams<typeof CancelLoadRowCommand>): void {
-		this._data.onCancelLoadRow(params);
-	}
+	/** Resolves avatar URIs for the asked emails and RETURNS them — the session's map is the cache, so an
+	 *  email already in it costs nothing. Nothing is pushed: the app merges the response into its own map. */
+	private async getMissingAvatars(emails: GraphAvatars): Promise<Record<string, string>> {
+		const session = this._data.session;
+		if (session == null) return {};
 
-	@ipcRequest(LoadRowRequest)
-	@trace()
-	private onLoadRowRequest(params: IpcParams<typeof LoadRowRequest>): Promise<IpcResponse<typeof LoadRowRequest>> {
-		return this._data.onLoadRowRequest(params);
-	}
+		const repoPath = session.repoPath;
 
-	@ipcCommand(GetMissingAvatarsCommand)
-	private async onGetMissingAvatars(params: IpcParams<typeof GetMissingAvatarsCommand>) {
-		if (this._data.session == null) return;
-
-		const repoPath = this._data.session.repoPath;
-
-		async function getAvatar(this: GraphWebviewProvider, email: string, id: string) {
+		const getAvatar = async (email: string, id: string): Promise<void> => {
 			const uri = await getAvatarUri(email, { ref: id, repoPath: repoPath });
-			this._data.session!.current.avatars.set(email, uri.toString(true));
-		}
+			session.current.avatars.set(email, uri.toString(true));
+		};
 
 		const promises: Promise<void>[] = [];
 
-		for (const [email, id] of Object.entries(params.emails)) {
-			if (this._data.session.current.avatars.has(email)) continue;
+		for (const [email, id] of Object.entries(emails)) {
+			if (session.current.avatars.has(email)) continue;
 
-			promises.push(getAvatar.call(this, email, id));
+			promises.push(getAvatar(email, id));
 		}
 
 		if (promises.length) {
 			await Promise.allSettled(promises);
-			this._data.updateAvatars();
 		}
+
+		const resolved: Record<string, string> = {};
+		for (const email of Object.keys(emails)) {
+			const url = session.current.avatars.get(email);
+			if (url == null) continue;
+
+			resolved[email] = url;
+		}
+
+		return resolved;
 	}
 
 	private readonly _avatarProxyCache = new DedupedAsyncCache<string, Uri | undefined>();
 	private readonly _avatarProxyFailed = new Set<string>();
 
-	@ipcCommand(ProxyAvatarsCommand)
-	private async onProxyAvatars(params: IpcParams<typeof ProxyAvatarsCommand>) {
-		if (this._data.session == null) return;
+	/** Re-fetches avatars the webview couldn't load (CSP/CORS) as data URIs and RETURNS them. Only the
+	 *  entries that actually proxied come back — the rest keep whatever the app already holds. */
+	private async proxyAvatars(avatars: Record<string, string>): Promise<Record<string, string>> {
+		const session = this._data.session;
+		if (session == null) return {};
 
-		const entries = Object.entries(params.avatars);
-		if (entries.length === 0) return;
+		const entries = Object.entries(avatars);
+		if (entries.length === 0) return {};
 
-		let changed = false;
+		const proxied: Record<string, string> = {};
 		await Promise.allSettled(
 			entries.map(([email, url]) => {
 				if (url.startsWith('data:') || this._avatarProxyFailed.has(url)) return Promise.resolve();
@@ -3061,8 +3114,9 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 						if (uri != null) {
 							if (this._data.session?.current.avatars.get(email) !== url) return;
 
-							this._data.session.current.avatars.set(email, uri.toString(true));
-							changed = true;
+							const dataUri = uri.toString(true);
+							this._data.session.current.avatars.set(email, dataUri);
+							proxied[email] = dataUri;
 						} else {
 							this._avatarProxyFailed.add(url);
 						}
@@ -3070,90 +3124,26 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			}),
 		);
 
-		if (changed) {
-			// Proxy replaces values for existing keys (same email, new data URI), so the map size doesn't
-			// change. Force the publisher's next avatars emission to ship the full map anyway.
-			this._graphSync.invalidateAvatars();
-			this._data.updateAvatars();
-		}
-	}
-
-	@ipcCommand(GetMissingRefsMetadataCommand)
-	private onGetMissingRefMetadata(params: IpcParams<typeof GetMissingRefsMetadataCommand>): Promise<void> {
-		return this._producers.onGetMissingRefMetadata(params);
-	}
-
-	@ipcCommand(SyncWipWatchesCommand)
-	@debug()
-	private onSyncWipWatches(params: IpcParams<typeof SyncWipWatchesCommand>): Promise<void> {
-		return this._wip.syncWipWatches(params);
-	}
-
-	@ipcCommand(GetMoreRowsCommand)
-	@trace()
-	private onGetMoreRows(
-		params: IpcParams<typeof GetMoreRowsCommand>,
-		sendSelectedRows: boolean = false,
-	): Promise<void> {
-		return this._data.onGetMoreRows(params, sendSelectedRows);
-	}
-
-	@ipcCommand(GraphSyncResyncCommand)
-	@debug()
-	private onSyncResync(params: IpcParams<typeof GraphSyncResyncCommand>): void {
-		this._data.onSyncResync(params);
+		return proxied;
 	}
 
 	/** Pages rows in until a host-initiated reveal/select target `id` is loaded, then ships the selection.
 	 *  Uses `limit: 0` for an UNCAPPED targeted walk: the default page size caps the walk at
 	 *  `pageItemLimit*10` (~2000) and would never reach a commit deeper than that (e.g. "Open in Commit
-	 *  Graph" on an old commit). The IPC scroll/scope-anchor paging keeps the cap — see `onGetMoreRows`. */
+	 *  Graph" on an old commit). The scroll/scope-anchor paging keeps the cap — see `onGetMoreRows`. */
 	private async revealRow(id: string): Promise<void> {
-		await this.onGetMoreRows({ id: id, limit: 0 }, true);
+		await this._data.onGetMoreRows(id, 0, true);
 
-		// The rows push above only ever projects a HIGHLIGHT; `DidChangeSelectionNotification` is what drives
+		// The rows push above only ever projects a HIGHLIGHT; the selection push is what drives
 		// `ensureRowVisible` → `navigateToCommit`, so the row also scrolls and adopts the anchor. Re-check
 		// `_selectedId`: this walk is uncapped and nothing cancels it, so a click mid-walk would otherwise
 		// make us ship that newer selection and scroll the user back to it.
 		if (this._selectedId === id && this._data.session?.current.ids.has(id)) {
-			void this.notifyDidChangeSelection();
+			this.notifyDidChangeSelection();
 		}
 	}
 
-	@ipcCommand(OpenPullRequestDetailsCommand)
-	@debug()
-	private async onOpenPullRequestDetails(params: IpcParams<typeof OpenPullRequestDetailsCommand>) {
-		const repo = this.repository;
-		if (repo == null) return undefined;
-
-		// id+providerId path: resolve the PR by id via the matching integration so the chip's
-		// actual PR opens — regardless of which branch is currently checked out.
-		if (params.id && params.providerId) {
-			const remote = await getBestRemoteWithIntegration(repo.path, {
-				filter: r => r.provider.id === params.providerId,
-			});
-			if (remote != null) {
-				const integration = await getRemoteIntegration(remote);
-				const pr = await integration?.getPullRequest(remote.provider.repoDesc, params.id);
-				if (pr != null) {
-					return this.container.views.pullRequest.showPullRequest(pr, repo.path);
-				}
-			}
-		}
-
-		// Fallback: resolve via the repo's current branch (legacy callers without id/provider).
-		const branch = await repo.git.branches.getBranch();
-		if (branch == null) return undefined;
-
-		const pr = await getBranchAssociatedPullRequest(this.container, branch);
-		if (pr == null) return undefined;
-
-		return this.container.views.pullRequest.showPullRequest(pr, branch);
-	}
-
-	@ipcCommand(RowActionCommand)
-	@debug()
-	private async onRowAction(params: IpcParams<typeof RowActionCommand>) {
+	private async executeRowAction(params: RowActionParams): Promise<void> {
 		const primaryRepoPath = this._data.session?.repoPath;
 		if (primaryRepoPath == null) return;
 
@@ -3222,17 +3212,15 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		}
 	}
 
-	@ipcCommand(TreemapFileActionCommand)
-	@debug()
-	private async onTreemapFileAction(params: IpcParams<typeof TreemapFileActionCommand>): Promise<void> {
+	private async openTreemapFile(action: 'open' | 'history', repoPath: string, path: string): Promise<void> {
 		// Rehydrate the file URI through the repo's own URI so the original scheme survives —
 		// `Uri.file()` would coerce virtual-workspace paths (vscode-vfs://, GitHub virtual provider)
 		// to a non-resolving file:// URI.
-		const repo = this.container.git.getRepository(params.repoPath);
+		const repo = this.container.git.getRepository(repoPath);
 		if (repo == null) return;
 
-		const uri = Uri.joinPath(repo.uri, params.path);
-		switch (params.action) {
+		const uri = Uri.joinPath(repo.uri, path);
+		switch (action) {
 			case 'open':
 				await commands.executeCommand('vscode.open', uri);
 				return;
@@ -3241,8 +3229,7 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		}
 	}
 
-	@ipcCommand(ChooseRepositoryCommand)
-	private async onChooseRepository() {
+	private async chooseRepository(): Promise<void> {
 		// // Ensure that the current repository is always last
 		// const repositories = this.container.git.openRepositories.sort(
 		// 	(a, b) =>
@@ -3275,20 +3262,26 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		});
 	}
 
-	@ipcCommand(ChooseAccountOrgCommand)
-	private async onChooseAccountOrg() {
+	private async chooseAccountOrg(): Promise<void> {
 		await executeCommand<Source>('gitlens.gk.switchOrganization', { source: 'graph' });
 	}
 
-	@ipcRequest(ChooseRefRequest)
-	private async onChooseRef(params: IpcParams<typeof ChooseRefRequest>) {
+	private async chooseRef(
+		title: string,
+		placeholder: string,
+		options?: {
+			allowedAdditionalInput?: ReferencesQuickPickOptions2['allowedAdditionalInput'];
+			include?: ReferencesQuickPickOptions2['include'];
+			picked?: string;
+		},
+	): Promise<DidChooseRefParams> {
 		if (this.repository == null) return undefined;
 
 		try {
-			const result = await showReferencePicker2(this.repository.path, params.title, params.placeholder, {
-				allowedAdditionalInput: params.allowedAdditionalInput,
-				include: params.include ?? ['branches', 'tags'],
-				picked: params.picked,
+			const result = await showReferencePicker2(this.repository.path, title, placeholder, {
+				allowedAdditionalInput: options?.allowedAdditionalInput,
+				include: options?.include ?? ['branches', 'tags'],
+				picked: options?.picked,
 			});
 			const pick = result?.value;
 
@@ -3302,15 +3295,16 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 					}
 				: undefined;
 		} catch (ex) {
-			Logger.error(ex, 'GraphWebviewProvider', 'onChooseRef');
+			Logger.error(ex, 'GraphWebviewProvider', 'chooseRef');
 			// The response type is `DidChooseRefParams | undefined`; `undefined` is the existing
 			// no-pick semantics so the frontend treats it as "user cancelled" rather than crashing.
 			return undefined;
 		}
 	}
 
-	@ipcRequest(ChooseComparisonRequest)
-	private async onChooseComparison(params: IpcParams<typeof ChooseComparisonRequest>) {
+	// `placeholder` isn't part of the signature — `showComparisonPicker` supplies its own per-step
+	// placeholder text; only `title` carries through from the caller (matches the pre-RPC behavior).
+	private async chooseComparison(title: string): Promise<DidChooseComparisonParams> {
 		if (this.repository == null) return { range: undefined };
 
 		const result = await showComparisonPicker(this.container, this.repository.path, {
@@ -3318,12 +3312,12 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 				switch (step) {
 					case 1:
 						return {
-							title: params.title,
+							title: title,
 							placeholder: 'Choose a branch or tag to show commits from',
 						};
 					case 2:
 						return {
-							title: params.title,
+							title: title,
 							placeholder: 'Choose a base to compare against (e.g., main)',
 						};
 				}
@@ -3333,41 +3327,37 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		return { range: result != null ? `${result.base.ref}..${result.head.ref}` : undefined };
 	}
 
-	@ipcRequest(ChooseAuthorRequest)
-	private async onChooseAuthor(params: IpcParams<typeof ChooseAuthorRequest>) {
+	private async chooseAuthor(title: string, placeholder: string, picked?: string[]): Promise<DidChooseAuthorParams> {
 		if (this.repository == null) return { authors: undefined };
 
-		const authors = params.picked != null ? new Set(params.picked) : undefined;
-		const contributors = await showContributorsPicker(
-			this.container,
-			this.repository,
-			params.title,
-			params.placeholder,
-			{
-				appendReposToTitle: true,
-				clearButton: true,
-				multiselect: true,
-				picked: c =>
-					authors != null &&
-					((c.email != null && authors.has(c.email)) ||
-						(c.name != null && authors.has(c.name)) ||
-						(c.username != null && authors.has(c.username))),
-			},
-		);
+		const authorsPicked = picked != null ? new Set(picked) : undefined;
+		const contributors = await showContributorsPicker(this.container, this.repository, title, placeholder, {
+			appendReposToTitle: true,
+			clearButton: true,
+			multiselect: true,
+			picked: c =>
+				authorsPicked != null &&
+				((c.email != null && authorsPicked.has(c.email)) ||
+					(c.name != null && authorsPicked.has(c.name)) ||
+					(c.username != null && authorsPicked.has(c.username))),
+		});
 
 		return { authors: contributors != null ? filterMap(contributors, c => c.email) : undefined };
 	}
 
-	@ipcRequest(ChooseFileRequest)
-	private async onChooseFile(params: IpcParams<typeof ChooseFileRequest>) {
+	private async chooseFile(
+		title: string,
+		type: 'file' | 'folder',
+		options?: { openLabel?: string; picked?: string[] },
+	): Promise<DidChooseFileParams> {
 		if (this.repository == null) return { files: undefined };
 
 		const uris = await window.showOpenDialog({
-			canSelectFiles: params.type === 'file',
-			canSelectFolders: params.type === 'folder',
-			canSelectMany: params.type === 'file',
-			title: params.title,
-			openLabel: params.openLabel,
+			canSelectFiles: type === 'file',
+			canSelectFolders: type === 'folder',
+			canSelectMany: type === 'file',
+			title: title,
+			openLabel: options?.openLabel,
 			defaultUri: this.repository.folder?.uri,
 		});
 
@@ -3378,15 +3368,16 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		return { files: files };
 	}
 
-	@ipcRequest(ResolveGraphScopeRequest)
-	private async onResolveGraphScope(
-		params: IpcParams<typeof ResolveGraphScopeRequest>,
-	): Promise<IpcResponse<typeof ResolveGraphScopeRequest>> {
+	private async resolveGraphScope(
+		repoPath: string,
+		scope: GraphScope,
+		signal?: AbortSignal,
+	): Promise<DidResolveGraphScopeParams> {
 		try {
-			const anchor = await this.resolveScopeAnchor(params.repoPath, params.scope.branchName);
+			const anchor = await this.resolveScopeAnchor(repoPath, scope.branchName, signal);
 			return {
 				scope: {
-					...params.scope,
+					...scope,
 					mergeBase: anchor?.mergeBase,
 					resolvedMergeTargetTipSha: anchor?.mergeTargetTipSha,
 					resolvedMergeTargetName: anchor?.mergeTargetName,
@@ -3394,12 +3385,23 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 				},
 			};
 		} catch (ex) {
-			Logger.error(ex, 'GraphWebviewProvider', 'onResolveGraphScope');
+			if (!isCancellationError(ex)) {
+				Logger.error(ex, 'GraphWebviewProvider', 'resolveGraphScope');
+			}
 			// Return the caller-supplied scope as a fallback so consumers reading `scope.mergeBase`,
 			// `scope.resolvedMergeTargetTipSha`, etc. don't crash on undefined property access.
-			return { scope: params.scope, error: ex instanceof Error ? ex.message : String(ex) };
+			return { scope: scope, error: ex instanceof Error ? ex.message : String(ex) };
 		}
 	}
+
+	// `signal` (not `save-last`): consumers sweep every cached anchor on receipt regardless of
+	// `repoPath` (see `GraphScopeService.onScopeAnchorsInvalidated`) — over-invalidating is cheap, and a
+	// hidden webview only needs to know that SOMETHING invalidated, not which repo, most recently.
+	private readonly _scopeAnchorsInvalidatedEvent = createRpcEvent<{ repoPath: string }>(
+		'scopeAnchorsInvalidated',
+		'signal',
+		{ repoPath: '' },
+	);
 
 	private invalidateScopeAnchors(): void {
 		this._scopeAnchorCache.clear();
@@ -3407,7 +3409,7 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		const repoPath = this.repository?.path ?? this._data.session?.repoPath;
 		if (repoPath == null) return;
 
-		void this.host.notify(DidInvalidateScopeAnchorsNotification, { repoPath: repoPath });
+		this._scopeAnchorsInvalidatedEvent.fire({ repoPath: repoPath });
 	}
 
 	/**
@@ -3428,13 +3430,20 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 	 * enrichment — this just stops scope from triggering it on cold branches that aren't already
 	 * covered by the package-level `branchOverviews` cache.
 	 */
-	private async resolveScopeAnchor(repoPath: string, branchName: string): Promise<ResolvedScopeAnchor | undefined> {
+	private async resolveScopeAnchor(
+		repoPath: string,
+		branchName: string,
+		signal?: AbortSignal,
+	): Promise<ResolvedScopeAnchor | undefined> {
+		signal?.throwIfAborted();
+
 		// Prefer the already-loaded branch from the in-memory graph snapshot — `session.current.branches`
 		// is the same data `getBranches()` would return (same underlying cache), so this is a
 		// synchronous shortcut on the hot path, not a different source of truth.
 		const branch =
 			this._data.session?.current.branches.get(branchName) ??
 			(await this.container.git.getRepositoryService(repoPath).branches.getBranch(branchName));
+		signal?.throwIfAborted();
 		if (branch == null) return undefined;
 
 		const cacheKey = branch.id;
@@ -3503,24 +3512,21 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		};
 	}
 
-	private _fireSelectionChangedDebounced: Deferrable<GraphWebviewProvider['fireSelectionChanged']> | undefined =
-		undefined;
-
-	@ipcCommand(UpdateSelectionCommand)
-	private onSelectionChanged(params: IpcParams<typeof UpdateSelectionCommand>) {
+	/** `GraphSelectionService.updateSelection` — the app's report of what the user selected. Runs
+	 *  undebounced: the coalescing now lives on the APP side of the wire (see the wrapper's
+	 *  `sendSelectionDebounced`), so an arrow-key scrub arrives here already collapsed to its final row. */
+	private updateSelection(selection: GraphSelection[]): void {
 		// An empty selection echo must never clear the selection hint we already hold. The webview only
 		// sends a real (non-empty) selection on user intent; an empty report is transient (the GK can't
 		// resolve a synthetic WIP row yet) or a scope/visibility filter-out, both of which the webview
 		// handles by keeping its inspection anchor and deriving an empty highlight. The host's
 		// `_selectedId`/`_selection` are now only a getGraph paging hint + command-target fallback, so
 		// leave them intact on an empty echo.
-		if (!params.selection.length && this._selectedId != null) return;
+		if (!selection.length && this._selectedId != null) return;
 
-		const item = params.selection.find(r => r.active) ?? params.selection[0];
-		this.setSelectedRows(item?.id, params.selection, { selected: true, hidden: item?.hidden });
-
-		this._fireSelectionChangedDebounced ??= debounce(this.fireSelectionChanged.bind(this), 50);
-		this._fireSelectionChangedDebounced(item?.id, item?.type);
+		const item = selection.find(r => r.active) ?? selection[0];
+		this.setSelectedRows(item?.id, selection, { selected: true, hidden: item?.hidden });
+		this.fireSelectionChanged(item?.id, item?.type);
 	}
 
 	private fireSelectionChanged(id: string | undefined, type: GitGraphRowKind | undefined) {
@@ -3557,13 +3563,10 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 	}
 
 	/**
-	 * Coalesces `DidFetch` pushes into a single in-flight notify with one trailing re-fire. The payload is
-	 * idempotent (just the latest fetch time), but `postMessage` is sequentialized by unique message id, so
-	 * an un-coalesced burst enqueues one post per trigger. When the queue drains slower than it fills — the
-	 * webview is throttled while the window is unfocused, or the host is busy — the backlog grows unbounded,
-	 * and since every slow post to a *view* is wrapped in `withProgress({ viewId })`, each drained post
-	 * re-shows the view's progress indicator, strobing it for the life of the drain. Bursts are routine:
-	 * `.git/FETCH_HEAD` force-fires `lastFetched` on any FS touch (see `Repository.onFetchHeadChanged`).
+	 * Coalesces `DidFetch` pushes into a single in-flight `getLastFetched()` read with one trailing
+	 * re-fire, rather than one read + `_repoStatusEvent.fire()` per trigger. Bursts are routine:
+	 * `.git/FETCH_HEAD` force-fires `lastFetched` on any FS touch (see `Repository.onFetchHeadChanged`),
+	 * and real-world startup logs showed 4 events in a 350ms window.
 	 */
 	private readonly _didFetchNotify = new CoalescedRun<boolean>(
 		() => this.runNotifyDidFetch(),
@@ -3577,99 +3580,88 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 	// multiple steps, the watcher sees each one) into a single downstream refresh.
 	private _lastFetchedHandlerDebounced: Deferrable<() => void> | undefined = undefined;
 
-	@trace()
-	private async notifyDidChangeColumns() {
-		if (!this.host.ready || !this.host.visible) {
-			this.host.addPendingIpcNotification(DidChangeColumnsNotification, this._ipcNotificationMap, this);
-			return false;
-		}
-
-		const columns = this.getColumns();
-		const columnSettings = this.getColumnSettings(columns);
-		return this.host.notify(DidChangeColumnsNotification, {
+	/** The complete columns + contexts snapshot. Both planes build it: `settingsContext` (the gear menu)
+	 *  is derived from the column settings AND the scroll-marker settings, so neither can push alone. */
+	private getColumnsState(): GraphColumnsState {
+		const columnSettings = this.getColumnSettings(this.getColumns());
+		return {
 			columns: columnSettings,
-			columnsRevision: this._columnsRevision,
-			context: this.getColumnHeaderContext(columnSettings),
+			headerContext: this.getColumnHeaderContext(columnSettings),
 			settingsContext: this.getGraphSettingsIconContext(columnSettings),
-		});
-	}
-
-	@trace()
-	private async notifyDidChangeScrollMarkers() {
-		if (!this.host.ready || !this.host.visible) {
-			this.host.addPendingIpcNotification(DidChangeScrollMarkersNotification, this._ipcNotificationMap, this);
-			return false;
-		}
-
-		const columns = this.getColumns();
-		const columnSettings = this.getColumnSettings(columns);
-		return this.host.notify(DidChangeScrollMarkersNotification, {
-			context: this.getGraphSettingsIconContext(columnSettings),
 			scrollMarkersContext: this.getScrollMarkersContext(),
-		});
+		};
+	}
+
+	private fireColumnsChanged(): void {
+		this._columnsChangedEvent.fire(this.getColumnsState());
+	}
+
+	/**
+	 * The complete filters snapshot — branch visibility, hidden refs/types, included refs, and the pinned
+	 * ref. All five are rebuilt from the same `graph:filtersByRepo` record, so one snapshot carries them all.
+	 *
+	 * `includeOnlyRefs` is two-phase: pass it in to build a snapshot around already-resolved refs; otherwise
+	 * this resolves them under a 100ms budget and, when the resolve is still pending, lets it continue in the
+	 * background — landing fires a SECOND complete snapshot rather than making the first paint wait.
+	 *
+	 * NOT safe to run concurrently with itself on the resolving path: `getIncludedRefs` supersedes through
+	 * one shared cancellation key, so the older build resolves to an empty ref set. Pushes go through
+	 * {@link fireFiltersChanged}, which coalesces for exactly that reason.
+	 */
+	@trace()
+	private async getFiltersState(includeOnlyRefs?: GraphIncludeOnlyRefs): Promise<GraphFiltersState> {
+		const graph = this._data.session?.current;
+		const filters = this.getFiltersByRepo(this._data.session?.repoPath);
+		const state: GraphFiltersState = {
+			branchesVisibility: this.getBranchesVisibility(filters),
+			excludeRefs: this.getExcludedRefs(filters, graph) ?? {},
+			excludeTypes: this.getExcludedTypes(filters) ?? {},
+			includeOnlyRefs: includeOnlyRefs,
+			pinnedRef: this.getPinnedRef(filters, graph),
+		};
+
+		if (includeOnlyRefs == null) {
+			const includedRefsResult = await this.getIncludedRefs(filters, graph, { timeout: 100 });
+			state.includeOnlyRefs = includedRefsResult.refs;
+			void includedRefsResult.continuation?.then(refs => {
+				if (refs == null) return;
+
+				void this.fireFiltersChanged(refs);
+			});
+		}
+
+		return state;
+	}
+
+	/**
+	 * Coalesces filters pushes into a single in-flight build with one trailing re-fire. Overlapping builds
+	 * would be worse than wasteful — see {@link getFiltersState} — and bursts are routine: every write fires
+	 * once through the `graph:filtersByRepo` storage echo and once from the writer's own await. The trailing
+	 * re-fire is an identical complete snapshot, so the duplicate push is idempotent.
+	 */
+	private readonly _filtersChangedNotify = new CoalescedRun<void>(
+		() => this.runFireFiltersChanged(),
+		() => void this.fireFiltersChanged(),
+	);
+
+	/** Fires the complete filters snapshot. Passing `includeOnlyRefs` skips the resolve (and the coalescer
+	 *  with it) — that's the two-phase continuation publishing refs it already has in hand. */
+	private async fireFiltersChanged(includeOnlyRefs?: GraphIncludeOnlyRefs): Promise<void> {
+		if (includeOnlyRefs != null) {
+			this._filtersChangedEvent.fire(await this.getFiltersState(includeOnlyRefs));
+			return;
+		}
+
+		await this._filtersChangedNotify.run();
+	}
+
+	private async runFireFiltersChanged(): Promise<void> {
+		this._filtersChangedEvent.fire(await this.getFiltersState());
 	}
 
 	@trace()
-	private async notifyDidChangePinnedRef(params?: IpcParams<typeof DidChangePinnedRefNotification>) {
-		if (!this.host.ready || !this.host.visible) {
-			this.host.addPendingIpcNotification(DidChangePinnedRefNotification, this._ipcNotificationMap, this);
-			return false;
-		}
-
-		if (params == null) {
-			const filters = this.getFiltersByRepo(this._data.session?.repoPath);
-			params = { pinnedRef: this.getPinnedRef(filters, this._data.session?.current) };
-		}
-
-		return this.host.notify(DidChangePinnedRefNotification, params);
-	}
-
-	@trace()
-	private async notifyDidChangeRefsVisibility(params?: IpcParams<typeof DidChangeRefsVisibilityNotification>) {
-		if (!this.host.ready || !this.host.visible) {
-			this.host.addPendingIpcNotification(DidChangeRefsVisibilityNotification, this._ipcNotificationMap, this);
-			return false;
-		}
-
-		if (params == null) {
-			const filters = this.getFiltersByRepo(this._data.session?.repoPath);
-			params = {
-				branchesVisibility: this.getBranchesVisibility(filters),
-				excludeRefs: this.getExcludedRefs(filters, this._data.session?.current) ?? {},
-				excludeTypes: this.getExcludedTypes(filters) ?? {},
-				includeOnlyRefs: undefined,
-			};
-
-			if (params?.includeOnlyRefs == null) {
-				const includedRefsResult = await this.getIncludedRefs(filters, this._data.session?.current, {
-					timeout: 100,
-				});
-				params.includeOnlyRefs = includedRefsResult.refs;
-				void includedRefsResult.continuation?.then(refs => {
-					if (refs == null) return;
-
-					void this.notifyDidChangeRefsVisibility({ ...params!, includeOnlyRefs: refs });
-				});
-			}
-		}
-
-		return this.host.notify(DidChangeRefsVisibilityNotification, params);
-	}
-
-	@trace()
-	private async notifyDidChangeConfiguration() {
-		if (!this.host.ready || !this.host.visible) {
-			this.host.addPendingIpcNotification(
-				DidChangeGraphConfigurationNotification,
-				this._ipcNotificationMap,
-				this,
-			);
-			return false;
-		}
-
-		return this.host.notify(DidChangeGraphConfigurationNotification, {
-			config: this.getComponentConfig(),
-		});
+	private notifyDidChangeConfiguration(): void {
+		this._configurationChangedEvent.fire(this.getComponentConfig());
 	}
 
 	private notifyDidFetch(): Promise<boolean> {
@@ -3678,105 +3670,55 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 
 	@trace()
 	private async runNotifyDidFetch(): Promise<boolean> {
-		if (!this.host.ready || !this.host.visible) {
-			this.host.addPendingIpcNotification(DidFetchNotification, this._ipcNotificationMap, this);
-			return false;
-		}
-
 		const repo = this.repository;
 		if (repo == null) return false;
 
 		const lastFetched = await repo.getLastFetched();
-		// Re-validate after the await — a repo swap mid-read would push the old repo's fetch time.
+		// Re-validate after the await — a repo swap mid-read would fire the old repo's fetch time.
 		if (this._repository !== repo) return false;
 		// FETCH_HEAD force-fires `lastFetched` even when the time didn't advance, so most triggers
-		// carry nothing new; skip those rather than spend a post on an identical payload.
+		// carry nothing new; skip those rather than fire an identical event.
 		if (lastFetched === this._lastSentFetchedAt) return true;
 
-		const success = await this.host.notify(DidFetchNotification, { lastFetched: new Date(lastFetched) });
-		// Stamp only after a successful send, and only if the repo still matches, so a failed
-		// transport or a mid-await swap can't poison the dedupe.
-		if (success && this._repository === repo) {
-			this._lastSentFetchedAt = lastFetched;
-		}
-		return success;
+		this._repoStatusEvent.fire({ repoPath: repo.path, lastFetched: lastFetched });
+		this._lastSentFetchedAt = lastFetched;
+		return true;
 	}
 
-	@trace()
-	private async notifyDidStartFeaturePreview(featurePreview?: FeaturePreview) {
-		if (!this.host.ready || !this.host.visible) {
-			this.host.addPendingIpcNotification(DidStartFeaturePreviewNotification, this._ipcNotificationMap, this);
-			return false;
-		}
+	/** Pull-based counterpart to `_repoStatusEvent` — seeds a freshly connected app. */
+	private async getRepoStatus(): Promise<GraphRepoStatus | undefined> {
+		const repo = this.repository;
+		if (repo == null) return undefined;
 
+		const lastFetched = await repo.getLastFetched();
+		if (this._repository !== repo) return undefined;
+
+		return { repoPath: repo.path, lastFetched: lastFetched };
+	}
+
+	/** Complete gating snapshot — `getGraphAccess()` restamps `_etagSubscription`, so the dedupe in
+	 *  `onSubscriptionChanged` stays keyed off the last snapshot the app was told about. */
+	private async getAccessState(featurePreview?: FeaturePreview): Promise<GraphAccessState> {
 		featurePreview ??= this.getFeaturePreview();
 		const [access] = await this.getGraphAccess();
-		return this.host.notify(DidStartFeaturePreviewNotification, {
-			featurePreview: featurePreview,
-			allowed: this.isGraphAccessAllowed(access, featurePreview),
-		});
-	}
-
-	@trace()
-	private async notifyDidChangeSelection() {
-		if (!this.host.ready || !this.host.visible) {
-			this.host.addPendingIpcNotification(DidChangeSelectionNotification, this._ipcNotificationMap, this);
-			return false;
-		}
-
-		return this.host.notify(DidChangeSelectionNotification, {
-			selection: convertSelectedRows(this._selectedRows) ?? {},
-		});
-	}
-
-	@trace()
-	private async notifyDidChangeSubscription() {
-		if (!this.host.ready || !this.host.visible) {
-			this.host.addPendingIpcNotification(DidChangeSubscriptionNotification, this._ipcNotificationMap, this);
-			return false;
-		}
-
-		const [access] = await this.getGraphAccess();
-		return this.host.notify(DidChangeSubscriptionNotification, {
+		return {
 			subscription: access.subscription.current,
-			allowed: this.isGraphAccessAllowed(access, this.getFeaturePreview()),
-		});
+			allowed: this.isGraphAccessAllowed(access, featurePreview),
+			featurePreview: featurePreview,
+		};
 	}
 
 	@trace()
-	private notifyDidChangeOrgSettings() {
-		void this.host.notify(DidChangeOrgSettings, { orgSettings: this.getOrgSettings() });
+	private async fireAccessChanged(featurePreview?: FeaturePreview): Promise<void> {
+		this._accessChangedEvent.fire(await this.getAccessState(featurePreview));
 	}
 
-	/** Last values sent to the webview — seed bulk state pushes without awaiting `gk`, and
-	 *  double as dedup sentinels for `notifyDidChangeCanInstallHooks`. */
-	private _lastCanInstallHooks: boolean | undefined;
-	private _lastHooksAgents: readonly { id: string; displayName: string; installed: boolean }[] | undefined;
-
+	/** Pushes the current selection map to the app. Only HOST-initiated reveals call this — a user's own
+	 *  click is never echoed back. The event is `save-last`, so a hidden webview replays the newest
+	 *  payload on show and needs no re-produce entry of its own. */
 	@trace()
-	private async notifyDidChangeCanInstallHooks() {
-		if (!this.host.visible) return;
-
-		const all = getContext('gitlens:agents:enabled', false) ? await this.container.agents.getAll() : [];
-		const hooksAgents = all
-			.filter(a => a.detected && a.hooksSupported && areHooksAllowedForAgent(a.name))
-			.map(a => ({ id: a.name, displayName: a.displayName, installed: a.hooksInstalled }));
-		const canInstall = hooksAgents.some(a => !a.installed);
-
-		if (
-			canInstall === this._lastCanInstallHooks &&
-			this._lastHooksAgents != null &&
-			hooksAgents.length === this._lastHooksAgents.length &&
-			hooksAgents.every(
-				(a, i) => a.id === this._lastHooksAgents![i].id && a.installed === this._lastHooksAgents![i].installed,
-			)
-		) {
-			return;
-		}
-
-		this._lastCanInstallHooks = canInstall;
-		this._lastHooksAgents = hooksAgents;
-		void this.host.notify(DidChangeCanInstallHooks, { canInstallHooks: canInstall, agents: hooksAgents });
+	private notifyDidChangeSelection(): void {
+		this._selectionChangedEvent.fire(convertSelectedRows(this._selectedRows));
 	}
 
 	private ensureRepositorySubscriptions(force?: boolean) {
@@ -3834,9 +3776,7 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 	}
 
 	private async notifyDidChangeRepoConnection() {
-		void this.host.notify(DidChangeRepoConnectionNotification, {
-			repositories: await this.getRepositoriesState(),
-		});
+		this._repoConnectionChangedEvent.fire({ repositories: await this.getRepositoriesState() });
 	}
 
 	private async getRepositoriesState(): Promise<GraphRepository[]> {
@@ -4732,8 +4672,7 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 					}
 					if (cancellation.token.isCancellationRequested || this._data.loading !== dataPromise) return;
 
-					void this.notifyDidChangeRefsVisibility();
-					void this.notifyDidChangePinnedRef();
+					void this.fireFiltersChanged();
 					this._data.notifyDidChangeRows(selectionChanged);
 					// Commit so the next `notifyDidChangeState` doesn't double-fire for events covered
 					// by this rebuild's invalidation.
@@ -4882,7 +4821,9 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		}
 
 		const filters = this.getFiltersByRepo(this.repository.path);
-		const refsVisibility: IpcParams<typeof DidChangeRefsVisibilityNotification> = {
+		// The bootstrap State's own copy of the filters — the first render reads these fields directly,
+		// before any RPC subscription exists.
+		const refsVisibility: Omit<GraphFiltersState, 'pinnedRef'> = {
 			branchesVisibility: this.getBranchesVisibility(filters),
 			excludeRefs: this.getExcludedRefs(filters, data) ?? {},
 			excludeTypes: this.getExcludedTypes(filters) ?? {},
@@ -4891,10 +4832,12 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		if (data != null) {
 			const includedRefsResult = await this.getIncludedRefs(filters, data, { timeout: 100 });
 			refsVisibility.includeOnlyRefs = includedRefsResult.refs;
+			// Two-phase: the bootstrap ships whatever resolved inside the budget; the slow merge-target
+			// resolve lands later and pushes a SECOND complete snapshot over the filters event.
 			void includedRefsResult.continuation?.then(refs => {
 				if (refs == null) return;
 
-				void this.notifyDidChangeRefsVisibility({ ...refsVisibility, includeOnlyRefs: refs });
+				void this.fireFiltersChanged(refs);
 			});
 		}
 
@@ -4957,8 +4900,6 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 				? { ...wipRows?.state, [createWipRowId(this.repository.path)]: primaryWipState }
 				: wipRows?.state;
 
-		const graphWalkthroughBanner = this.getGraphWalkthroughBannerState();
-
 		// `mixed` means the workspace has both public and private repos — so a gated (private) repo can
 		// offer switching to a public one. Only computed when access is denied (the only time the gate, and
 		// thus the switch affordance, is shown) to avoid an aggregate visibility() scan on the common
@@ -4989,19 +4930,21 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			},
 			branchState: branchState,
 			branchStateRevision: branchStateRevision,
-			lastFetched: new Date(getSettledValue(lastFetchedResult)!),
+			lastFetched: getSettledValue(lastFetchedResult)!,
 			selectedRows: convertSelectedRows(this._selectedRows),
 			subscription: access?.subscription.current,
 			allowed: allowed,
 			trusted: true,
 			allowRepoSwitch: allowRepoSwitch,
-			// Rows-plane fields are owned by the publisher's channel now — they never travel on this State.
-			// The webview keeps whatever the publisher last delivered (the current reducer sees exactly the
-			// old "skipRows" shape); `refsMetadata` stays here as the authoritative full-map reset-anchor
-			// (its wholesale REPLACE can't be expressed by the publisher's spread-merge delta). `sync`
-			// carries the publisher's baseline stamp so R1c can initialize the webview's `{generation, seq}`.
+			// Rows-plane fields are owned by the `graph:rows` channel now — they never travel on this State.
+			// The webview keeps whatever the channel last delivered (the current reducer sees exactly the
+			// old "skipRows" shape).
 			avatars: undefined,
-			refsMetadata: this._producers.serializeRefsMetadata(),
+			// BOOTSTRAP ONLY: a fresh webview needs the feature-off `null` (or the already-resolved map)
+			// before its first request. A live push must ship NOTHING here — `refsMetadata` is owned by
+			// `GraphRefsMetadataService` (request/response + the reset event), and a full-state REPLACE on
+			// every push is exactly the dual-writer clobber this migration removes.
+			refsMetadata: bootstrap ? this._producers.serializeRefsMetadata() : undefined,
 			loading: bootstrap === true,
 			rowsStatsLoading: undefined,
 			rowsStatsIncluded: undefined,
@@ -5009,15 +4952,7 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			reachabilityTable: undefined,
 			downstreams: undefined,
 			paging: undefined,
-			// The bootstrap delivers NO rows-plane state, so the webview's baseline must start "empty"
-			// (`seq: -1`), never the publisher's current seq — a hard reconnect (fresh HTML) stamping the
-			// live seq would tell an empty webview it already holds everything, and its sync-hello would
-			// no-op, leaving the graph blank until the next rows change tripped the splice guard. With -1
-			// the hello forces a fresh snapshot on hard reconnects, while a first boot's hello is satisfied
-			// by the onReady snapshot (the publisher's this-connection watermark) at no extra cost.
-			sync: { generation: this._graphSync.generation, seq: -1 },
 			columns: columnSettings,
-			columnsRevision: this._columnsRevision,
 			config: this.getComponentConfig(),
 			context: {
 				header: this.getColumnHeaderContext(columnSettings),
@@ -5034,15 +4969,8 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			searchMode: searchMode,
 			useNaturalLanguageSearch: useNaturalLanguageSearch,
 			featurePreview: featurePreview,
-			orgSettings: this.getOrgSettings(),
 			overview: this._panels.getOverviewData(),
-			agentsBannerCollapsed: this.getAgentsBannerCollapsed(),
 			mcpCanAutoRegister: this.container.gkMcp?.isRegistrationAllowed ?? false,
-			canInstallHooks: this._lastCanInstallHooks ?? false,
-			hooksAgents: this._lastHooksAgents ?? [],
-			graphWalkthroughBannerCollapsed: graphWalkthroughBanner.dismissed,
-			graphWalkthroughComplete: this.getGraphWalkthroughComplete(),
-			graphWalkthroughStarted: this.getGraphWalkthroughStarted(),
 			layoutPromptNeeded: this.getLayoutPromptNeeded(),
 			upgradedFromPreV19: satisfies(this.container.previousVersion, '< 19'),
 			searchRequest: searchRequest,
@@ -5119,7 +5047,12 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		return result;
 	}
 
-	private updateColumns(columnsCfg: GraphColumnsConfig, options?: { keepStoredModes?: boolean }) {
+	/** Awaitable: callers (the webview's `setColumns`) use resolution as the happens-after edge for their
+	 *  own write, so the storage write must land before it settles. */
+	private async updateColumns(
+		columnsCfg: GraphColumnsConfig,
+		options?: { keepStoredModes?: boolean },
+	): Promise<void> {
 		let columns = this.container.storage.getWorkspace('graph:columns');
 		for (const [key, value] of Object.entries(columnsCfg)) {
 			// `mode` is host-owned — webviews only echo it, and a stale echo (second panel / pre-command
@@ -5127,15 +5060,14 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			const mode = options?.keepStoredModes ? columns?.[key]?.mode : value.mode;
 			columns = updateRecordValue(columns, key, { ...value, mode: mode });
 		}
-		void this.container.storage
-			.storeWorkspace('graph:columns', columns)
-			.catch((ex: unknown) => Logger.error(ex, 'graph: failed to persist columns'));
-		void this.notifyDidChangeColumns();
-	}
 
-	@ipcCommand(UpdateWipDraftCommand)
-	private onWipDraftUpdate(params: IpcParams<typeof UpdateWipDraftCommand>) {
-		this._wip.writeWipDraftToStorage(params.worktreePath, params.draft);
+		try {
+			await this.container.storage.storeWorkspace('graph:columns', columns);
+		} catch (ex) {
+			Logger.error(ex, 'graph: failed to persist columns');
+		}
+
+		this.fireColumnsChanged();
 	}
 
 	/** The id of the whole-remote "Hide Remote" wildcard entry (`type: 'remote'`, `name: '*'`) covering
@@ -5151,7 +5083,13 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		return undefined;
 	}
 
-	private updateExcludedRefs(repoPath: string | undefined, refs: GraphExcludedRef[], visible: boolean) {
+	/** Hides/un-hides refs. Resolves only once the storage write has landed and the filters event has
+	 *  fired, so the caller can treat resolution as "my write is no longer outstanding". */
+	private async updateExcludedRefs(
+		repoPath: string | undefined,
+		refs: GraphExcludedRef[],
+		visible: boolean,
+	): Promise<void> {
 		if (repoPath == null || !refs?.length) return;
 
 		let storedExcludeRefs: StoredGraphFilters['excludeRefs'] = this.getFiltersByRepo(repoPath)?.excludeRefs ?? {};
@@ -5227,8 +5165,8 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			}
 		}
 
-		void this.updateFiltersByRepo(repoPath, { excludeRefs: storedExcludeRefs });
-		void this.notifyDidChangeRefsVisibility();
+		await this.updateFiltersByRepo(repoPath, { excludeRefs: storedExcludeRefs });
+		await this.fireFiltersChanged();
 		// Hidden state is baked into the side bar's row contexts (`+hidden`/`+hiddenbyremote`), so a visibility
 		// change has to rebuild them the same way a pin change does (`updatePinnedRef` below).
 		this._panels.notifySidebarInvalidated();
@@ -5237,7 +5175,7 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 	/** Clears every stored exclusion owned by a remote — the wildcard entry hiding the whole remote plus any
 	 *  individually hidden branches under it — in one write. Reuses {@link updateExcludedRefs}'s removal path
 	 *  (visible=true removes by entry id) rather than duplicating the storage/notify/invalidate flow. */
-	private showRemoteRefs(repoPath: string | undefined, remoteName: string) {
+	private async showRemoteRefs(repoPath: string | undefined, remoteName: string): Promise<void> {
 		const storedExcludeRefs = this.getFiltersByRepo(repoPath)?.excludeRefs;
 		if (!hasKeys(storedExcludeRefs)) return;
 
@@ -5249,10 +5187,11 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			}
 		}
 
-		this.updateExcludedRefs(repoPath, refs, true);
+		await this.updateExcludedRefs(repoPath, refs, true);
 	}
 
-	private updatePinnedRef(repoPath: string | undefined, ref: GraphPinnedRef | null) {
+	/** Pins/unpins a ref. Resolves once the storage write has landed and the filters event has fired. */
+	private async updatePinnedRef(repoPath: string | undefined, ref: GraphPinnedRef | null): Promise<void> {
 		if (repoPath == null) return;
 
 		const storedPinnedRef =
@@ -5260,14 +5199,10 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 				? { id: ref.id, type: ref.type as StoredGraphRefType, name: ref.name, owner: ref.owner }
 				: undefined;
 
-		void this.updateFiltersByRepo(repoPath, { pinnedRef: storedPinnedRef });
-		// Passed the new pin directly rather than letting the notification re-read it. Not a race fix —
-		// `getWorkspace` is a synchronous `Memento.get` and sees the value `update()` sets before its
-		// promise settles, which is why the sibling filter writers here notify the same way without
-		// awaiting. This just avoids the round-trip when the value is already in hand.
-		void this.notifyDidChangePinnedRef({
-			pinnedRef: this.getPinnedRef({ pinnedRef: storedPinnedRef }, this._data.session?.current),
-		});
+		await this.updateFiltersByRepo(repoPath, { pinnedRef: storedPinnedRef });
+		// Re-read rather than passing the new pin through: the snapshot is complete, and the write above is
+		// awaited, so storage is authoritative here.
+		await this.fireFiltersChanged();
 		this._panels.notifySidebarInvalidated();
 		// Every HOST-serialized context bakes `+pinned` in when it's built, so each one has to be rebuilt on a
 		// pin change: the side bar above, and the WIP header's branch kebab here (`wip.stats.branchContext`).
@@ -5320,8 +5255,7 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 
 			// `Math.max(0, …)` clamps clock-skew (future-dated timestamps) so a stale clock
 			// can't pin a session as permanently "recent".
-			const recent =
-				Math.max(0, now - s.lastActivity.getTime()) < GraphWebviewProvider.agentBranchesIdleThresholdMs;
+			const recent = Math.max(0, now - s.lastActivity) < GraphWebviewProvider.agentBranchesIdleThresholdMs;
 			if (!isActiveAgentPhase(s.phase) && !recent) continue;
 
 			const branch = graph.branches.get(s.worktree.branch.name);
@@ -5431,15 +5365,13 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		return refs;
 	}
 
-	@ipcCommand(UpdateIncludedRefsCommand)
-	private onUpdateIncludeOnlyRefs(params: IpcParams<typeof UpdateIncludedRefsCommand>) {
-		this.updateIncludeOnlyRefs(this._data.session?.repoPath, params);
-	}
-
-	private updateIncludeOnlyRefs(
+	/** Sets the branches-visibility mode and/or the include-only ref set. Resolves once the storage write
+	 *  has landed and the filters event has fired. */
+	private async updateIncludeOnlyRefs(
 		repoPath: string | undefined,
-		{ branchesVisibility, refs }: IpcParams<typeof UpdateIncludedRefsCommand>,
-	) {
+		branchesVisibility: GraphBranchesVisibility | undefined,
+		refs: GraphIncludeOnlyRef[] | undefined,
+	): Promise<void> {
 		if (repoPath == null) return;
 
 		let storedIncludeOnlyRefs: StoredGraphFilters['includeOnlyRefs'];
@@ -5467,22 +5399,20 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			});
 		}
 
-		void this.updateFiltersByRepo(repoPath, {
+		await this.updateFiltersByRepo(repoPath, {
 			branchesVisibility: branchesVisibility,
 			includeOnlyRefs: storedIncludeOnlyRefs,
 		});
-		void this.notifyDidChangeRefsVisibility();
+		await this.fireFiltersChanged();
 	}
 
-	@ipcCommand(UpdateExcludeTypesCommand)
-	private onUpdateExcludedTypes(params: IpcParams<typeof UpdateExcludeTypesCommand>) {
-		this.updateExcludedTypes(this._data.session?.repoPath, params);
-	}
-
-	private updateExcludedTypes(
+	/** Toggles a hidden ref TYPE (remotes/stashes/tags). Resolves once the storage write has landed and
+	 *  the filters event has fired. */
+	private async updateExcludedTypes(
 		repoPath: string | undefined,
-		{ key, value }: IpcParams<typeof UpdateExcludeTypesCommand>,
-	) {
+		key: keyof GraphExcludeTypes,
+		value: boolean,
+	): Promise<void> {
 		if (repoPath == null) return;
 
 		let excludeTypes = this.getFiltersByRepo(repoPath)?.excludeTypes;
@@ -5497,16 +5427,13 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			value: value,
 		});
 
-		void this.updateFiltersByRepo(repoPath, { excludeTypes: excludeTypes });
-		void this.notifyDidChangeRefsVisibility();
+		await this.updateFiltersByRepo(repoPath, { excludeTypes: excludeTypes });
+		await this.fireFiltersChanged();
 	}
 
-	@ipcCommand(ResetGraphFiltersCommand)
-	private onResetFilters() {
-		this.resetFilters(this._data.session?.repoPath);
-	}
-
-	private resetFilters(repoPath: string | undefined) {
+	/** Clears every stored filter for the repo. Resolves once the storage write (when there was anything
+	 *  to clear) has landed and the filters event has fired. */
+	private async resetFilters(repoPath: string | undefined): Promise<void> {
 		if (repoPath == null) return;
 
 		const filters = this.getFiltersByRepo(repoPath);
@@ -5526,14 +5453,15 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			this.host.sendTelemetryEvent('graph/filters/cleared', cleared);
 
 			const filtersByRepo = this.container.storage.getWorkspace('graph:filtersByRepo');
-			void this.container.storage.storeWorkspace(
+			await this.container.storage.storeWorkspace(
 				'graph:filtersByRepo',
 				updateRecordValue(filtersByRepo, repoPath, undefined),
 			);
 		}
 
-		// Always notify so the webview-side deferred scope clear (set by handleModeClear) runs.
-		void this.notifyDidChangeRefsVisibility();
+		// Always fire, even when nothing changed: the snapshot is complete so a redundant push is harmless,
+		// and the app consumes its deferred scope clear (set by `handleModeClear`) off this push.
+		await this.fireFiltersChanged();
 	}
 
 	private resetHoverCache() {
@@ -5622,10 +5550,9 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			resolution,
 		);
 
-		// For non-active worktrees, the active-repo working-tree watcher won't fire, so the
-		// host's regular `DidChangeWorkingTreeNotification` won't reach the panel. Fetch the
-		// updated WIP for this specific repo and push it directly — one `git status`, no
-		// round-trip from the panel.
+		// For non-active worktrees, the active-repo working-tree watcher won't fire, so the host's
+		// regular `workingTreeChanged` event won't reach the panel. Fetch the updated WIP for this
+		// specific repo and push it directly — one `git status`, no round-trip from the panel.
 		const repo = await this.container.git.getOrAddRepository(Uri.file(value.repoPath), {
 			opened: false,
 			detectNested: true,
@@ -5640,10 +5567,7 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		// them — the host just did the work, the webview's classifier wouldn't match
 		// `git diff --shortstat` semantics for renames/conflicts, and the derived value would drop
 		// `pausedOpStatus` / `context` (real visible regressions during a paused op).
-		void this.host.notify(DidRequestWipRefetchNotification, {
-			repoPath: value.repoPath,
-			wip: result?.wip,
-		});
+		this._wipRefetchedEvent.fire({ repoPath: value.repoPath, wip: result?.wip });
 	}
 
 	/** Solo the WIP row's worktree onto its current branch. The WIP context carries only an
@@ -5670,10 +5594,10 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 				// prop, which the webview echoes into its anchor. `writeWipDraftToStorage` is the
 				// durable mirror of the webview-side flush so the message persists across sessions
 				// even if the user never edits.
-				this._wip.writeWipDraftToStorage(targetRepoPath, { message: message, messageDirty: true });
+				void this._wip.writeWipDraftToStorage(targetRepoPath, { message: message, messageDirty: true });
 				this.setSelectedRows(wipRowId);
-				void this.notifyDidChangeSelection();
-				void this.host.notify(DidRequestGraphActionNotification, {
+				this.notifyDidChangeSelection();
+				this._requestActionEvent.fire({
 					action: 'show-wip',
 					target: { sha: wipRowId, worktreePath: targetRepoPath },
 					commitMessage: message,
@@ -5709,7 +5633,7 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		columns = updateRecordValue(columns, name, column);
 		await this.container.storage.storeWorkspace('graph:columns', columns);
 
-		void this.notifyDidChangeColumns();
+		this.fireColumnsChanged();
 
 		if (
 			name === 'changes' &&
@@ -5733,7 +5657,7 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		columns = updateRecordValue(columns, name, column);
 		await this.container.storage.storeWorkspace('graph:columns', columns);
 
-		void this.notifyDidChangeColumns();
+		this.fireColumnsChanged();
 	}
 
 	@debug()
@@ -5750,7 +5674,7 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 
 		if (updated) {
 			await configuration.updateEffective('graph.scrollMarkers.additionalTypes', scrollMarkers);
-			void this.notifyDidChangeScrollMarkers();
+			this.fireColumnsChanged();
 		}
 	}
 
@@ -5767,7 +5691,7 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		columns = updateRecordValue(columns, name, column);
 		await this.container.storage.storeWorkspace('graph:columns', columns);
 
-		void this.notifyDidChangeColumns();
+		this.fireColumnsChanged();
 	}
 
 	/** The user's current/active worktree path — anchors compare actions whose intent is "from
@@ -5785,7 +5709,7 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 	/** Pushes the request to the graph webview to switch into its embedded Visual History
 	 *  (timeline) display mode, scoped to the given file/folder. Fire-and-forget. */
 	private notifyOpenTimelineScope(params: DidRequestOpenTimelineScopeParams): void {
-		void this.host.notify(DidRequestOpenTimelineScopeNotification, params);
+		this._requestOpenTimelineScopeEvent.fire(params);
 	}
 
 	/** Pushes a search query to the graph webview without triggering a full state refresh — the

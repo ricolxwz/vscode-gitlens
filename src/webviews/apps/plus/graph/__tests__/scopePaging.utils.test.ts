@@ -27,7 +27,7 @@ suite('pickScopePageTarget', () => {
 	});
 
 	test('returns undefined when mergeBase is already in flight', () => {
-		// Dedupe guard — a previous unreachable event already issued GetMoreRowsCommand for the
+		// Dedupe guard — a previous unreachable event already issued a page request for the
 		// mergeBase. Don't re-fire while the response is still in flight.
 		const anchors = new Set(['branchTip']);
 		const loaded = new Set(['branchTip']);
@@ -36,7 +36,7 @@ suite('pickScopePageTarget', () => {
 	});
 
 	test('returns undefined when no anchors are missing and mergeBase is undefined', () => {
-		// Pre-mergeBase-resolution state: scope just got set, ResolveGraphScopeRequest hasn't
+		// Pre-mergeBase-resolution state: scope just got set, GraphScopeService.resolveScope hasn't
 		// returned yet. Library can't have flagged anchors unreachable for the mergeBase path
 		// since u is undefined; nothing useful for us to page.
 		const anchors = new Set(['branchTip']);

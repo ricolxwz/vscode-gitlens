@@ -1,5 +1,6 @@
 import './settings.scss';
-import type { Remote } from '@eamodio/supertalk';
+import type { Remote, Subscription } from '@eamodio/supertalk';
+import { subscribe } from '@eamodio/supertalk';
 import { ContextProvider, provide } from '@lit/context';
 import { html, nothing } from 'lit';
 import { customElement, property, query } from 'lit/decorators.js';
@@ -8,6 +9,7 @@ import type { SettingsServices } from '../../settings/settingsService.js';
 import { SignalWatcherWebviewApp } from '../shared/appBase.js';
 import { createDefaultSubscriptionContextState, subscriptionContext } from '../shared/contexts/subscription.js';
 import { setDefaultDateLocales } from '../shared/date.js';
+import { subscribeAll } from '../shared/events/subscriptions.js';
 import { getHost } from '../shared/host/context.js';
 import { RpcController } from '../shared/rpc/rpcController.js';
 import { SettingsActions } from './actions.js';
@@ -60,7 +62,11 @@ export class GlSettingsApp extends SignalWatcherWebviewApp {
 	});
 
 	private _actions?: SettingsActions;
-	private _unsubscribes: (() => void)[] = [];
+	/**
+	 * RPC event subscription — released at disconnect (before the actions its subscriber captured
+	 * are disposed) and recreated per ready against the new session's actions.
+	 */
+	private _eventsSubscription?: Subscription;
 	private _stopAutoPersist?: () => void;
 
 	private _rpc = new RpcController<SettingsServices>(this, {
@@ -76,7 +82,7 @@ export class GlSettingsApp extends SignalWatcherWebviewApp {
 	override connectedCallback(): void {
 		super.connectedCallback?.();
 
-		const context = this.context;
+		const context = this.consumeOneShotAttribute(this.context);
 		this.context = undefined!;
 		this.initWebviewContext(context);
 
@@ -86,10 +92,12 @@ export class GlSettingsApp extends SignalWatcherWebviewApp {
 	override disconnectedCallback(): void {
 		window.removeEventListener('keydown', this.handleGlobalKeyDown);
 
-		for (const unsubscribe of this._unsubscribes) {
-			unsubscribe();
-		}
-		this._unsubscribes = [];
+		// Unsubscribe BEFORE the actions/state below are disposed: the retained handle would
+		// otherwise re-issue its subscriber — which closes over those disposed objects — on the
+		// next handshake, ahead of `_onRpcReady`'s replacement. A fresh subscription is created
+		// per ready anyway, so nothing is lost by releasing this one here.
+		this._eventsSubscription?.unsubscribe();
+		this._eventsSubscription = undefined;
 
 		this._stopAutoPersist?.();
 		this._stopAutoPersist = undefined;
@@ -97,8 +105,10 @@ export class GlSettingsApp extends SignalWatcherWebviewApp {
 		this._actions?.dispose();
 		this._actions = undefined;
 
+		// `resetAll()` only — `dispose()` is permanent teardown (it clears the signal
+		// registrations), and this element can reconnect during startup churn; a disposed state
+		// group would make the next session's `startAutoPersist()` watch nothing.
 		this._state.resetAll();
-		this._state.dispose();
 
 		super.disconnectedCallback?.();
 	}
@@ -107,14 +117,10 @@ export class GlSettingsApp extends SignalWatcherWebviewApp {
 		const s = this._state;
 
 		try {
-			const [settings, subscription, integrations, ai, agents, walkthrough] = await Promise.all([
-				services.settings,
-				services.subscription,
-				services.integrations,
-				services.ai,
-				services.agents,
-				services.walkthrough,
-			]);
+			const [settings, subscription] = await Promise.all([services.settings, services.subscription]);
+
+			// Subscription changes invalidate the promo cache (`gl-feature-badge`).
+			this._promos.connect(this._rpc.connection!);
 
 			const actions = new SettingsActions(s, services, settings);
 			this._actions = actions;
@@ -153,45 +159,61 @@ export class GlSettingsApp extends SignalWatcherWebviewApp {
 
 			this._stopAutoPersist = s.startAutoPersist();
 
-			// Subscribe to events FIRST so changes during the initial fetch aren't missed
-			const unsubConfig = await settings.onConfigChanged(snapshot => {
-				setDefaultDateLocales(snapshot.config.defaultDateLocale);
-				s.config.set(snapshot.config);
-				s.customSettings.set(snapshot.customSettings);
-			});
-			const unsubAnchor = await settings.onAnchorRequested(e => {
-				actions.openAnchor(e.anchor);
-			});
-			// Shared-service events feeding the Cloud Integrations & AI panels (and the Autolinks banner)
-			const unsubIntegrations = await integrations.onIntegrationsChanged(data => {
-				s.cloudIntegrations.set(data.integrations);
-			});
-			const unsubAiModel = await ai.onModelChanged(() => {
-				// Fires for scope-only changes too (the payload is always the global model), so
-				// route through `refreshAiModels()` to re-read both it and the scoped list rather
-				// than setting `s.aiModel` from a payload that may not reflect what changed.
-				void actions.refreshAiModels();
-			});
-			const unsubAiState = await ai.onStateChanged(state => {
-				s.aiState.set(state);
-			});
-			// Get Started walkthrough steps' live progress
-			const unsubWalkthrough = await walkthrough.onProgressChanged(progress => {
-				s.walkthrough.set(progress);
-			});
-			const unsubAgents = await agents.onAgentsChanged(list => {
-				s.agents.set(list);
-			});
+			// Subscribe to events FIRST so changes during the initial fetch aren't missed — synchronous:
+			// `subscribe()` buffers the wire subscribe until the connection's handshake completes.
+			// Recreated per ready (not `??=`): the subscriber closes over this session's state/actions —
+			// see the equivalent note in commitDetails.ts.
+			this._eventsSubscription?.unsubscribe();
+			this._eventsSubscription = subscribe<SettingsServices>(this._rpc.connection!, async remoteServices => {
+				const [settings, integrations, ai, agents, walkthrough] = await Promise.all([
+					remoteServices.settings,
+					remoteServices.integrations,
+					remoteServices.ai,
+					remoteServices.agents,
+					remoteServices.walkthrough,
+				]);
 
-			this._unsubscribes.push(
-				unsubConfig,
-				unsubAnchor,
-				unsubIntegrations,
-				unsubAiModel,
-				unsubAiState,
-				unsubAgents,
-				unsubWalkthrough,
-			);
+				return subscribeAll([
+					() =>
+						settings.onConfigChanged(snapshot => {
+							setDefaultDateLocales(snapshot.config.defaultDateLocale);
+							s.config.set(snapshot.config);
+							s.customSettings.set(snapshot.customSettings);
+						}),
+					() =>
+						settings.onAnchorRequested(e => {
+							actions.openAnchor(e.anchor);
+						}),
+					// Shared-service events feeding the Cloud Integrations & AI panels (and the Autolinks banner)
+					() =>
+						integrations.onIntegrationsChanged(data => {
+							s.cloudIntegrations.set(data.integrations);
+						}),
+					() =>
+						ai.onModelChanged(() => {
+							// Fires for scope-only changes too (the payload is always the global model), so
+							// route through `refreshAiModels()` to re-read both it and the scoped list rather
+							// than setting `s.aiModel` from a payload that may not reflect what changed.
+							void actions.refreshAiModels();
+						}),
+					() =>
+						ai.onStateChanged(state => {
+							s.aiState.set(state);
+						}),
+					// Get Started walkthrough steps' live progress
+					() =>
+						walkthrough.onProgressChanged(progress => {
+							s.walkthrough.set(progress);
+						}),
+					() =>
+						agents.onAgentsChanged(list => {
+							s.agents.set(list);
+						}),
+				]);
+			});
+			// Wait for the subscriptions to land before the initial fetch below, preserving the
+			// subscribe-before-fetch guarantee (`ready` settles once, so reconnects don't re-wait).
+			await this._eventsSubscription.ready;
 
 			const context = await settings.getInitialContext();
 			setDefaultDateLocales(context.config.defaultDateLocale);

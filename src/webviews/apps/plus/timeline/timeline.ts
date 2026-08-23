@@ -1,5 +1,5 @@
 import './timeline.scss';
-import type { Remote } from '@eamodio/supertalk';
+import type { Remote, Subscription } from '@eamodio/supertalk';
 import { html, nothing } from 'lit';
 import { customElement, property, query } from 'lit/decorators.js';
 import { isSubscriptionPaid } from '../../../../plus/gk/utils/subscription.utils.js';
@@ -62,7 +62,11 @@ export class GlTimelineApp extends SignalWatcherWebviewApp {
 
 	private _actions?: TimelineActions;
 	private _datasetResource?: Resource<TimelineDatasetResult | undefined>;
-	private _unsubscribeEvents?: () => void;
+	/**
+	 * RPC event subscription — released at disconnect (before the actions its subscriber captured
+	 * are disposed) and recreated per ready against the new session's actions.
+	 */
+	private _eventsSubscription?: Subscription;
 	private _stopAutoPersist?: () => void;
 	private _chartDataset?: TimelineDatasetResult['dataset'];
 	private _chartDataPromise?: Promise<TimelineDatasetResult['dataset']>;
@@ -80,14 +84,18 @@ export class GlTimelineApp extends SignalWatcherWebviewApp {
 	override connectedCallback(): void {
 		super.connectedCallback?.();
 
-		const context = this.context;
+		const context = this.consumeOneShotAttribute(this.context);
 		this.context = undefined!;
 		this.initWebviewContext(context);
 	}
 
 	override disconnectedCallback(): void {
-		this._unsubscribeEvents?.();
-		this._unsubscribeEvents = undefined;
+		// Unsubscribe BEFORE the actions/state below are disposed: the retained handle would
+		// otherwise re-issue its subscriber — which closes over those disposed objects — on the
+		// next handshake, ahead of `_onRpcReady`'s replacement. A fresh subscription is created
+		// per ready anyway, so nothing is lost by releasing this one here.
+		this._eventsSubscription?.unsubscribe();
+		this._eventsSubscription = undefined;
 
 		this._stopAutoPersist?.();
 		this._stopAutoPersist = undefined;
@@ -100,8 +108,10 @@ export class GlTimelineApp extends SignalWatcherWebviewApp {
 		this._actions?.dispose();
 		this._actions = undefined;
 
+		// `resetAll()` only — `dispose()` is permanent teardown (it clears the signal
+		// registrations), and this element can reconnect during startup churn; a disposed state
+		// group would make the next session's `startAutoPersist()` watch nothing.
 		this._state.resetAll();
-		this._state.dispose();
 
 		super.disconnectedCallback?.();
 	}
@@ -110,13 +120,10 @@ export class GlTimelineApp extends SignalWatcherWebviewApp {
 		const s = this._state;
 
 		// Resolve the timeline sub-service and domain sub-services
-		const [timeline, repositories, repository, subscription, config] = await Promise.all([
-			services.timeline,
-			services.repositories,
-			services.repository,
-			services.subscription,
-			services.config,
-		]);
+		const [timeline, repository] = await Promise.all([services.timeline, services.repository]);
+
+		// Subscription changes invalidate the promo cache.
+		this._promos.connect(this._rpc.connection!);
 
 		// Create dataset resource — fetcher reads current state signals via closure. `loadedSpanMs`
 		// is what powers progressive load-more: when the user zooms past the loaded oldest, the
@@ -154,10 +161,13 @@ export class GlTimelineApp extends SignalWatcherWebviewApp {
 			onConfigChanged: () => void actions.fetchDisplayConfig(),
 			onRepoCountChanged: () => void actions.fetchRepoCount(),
 		};
-		this._unsubscribeEvents = await setupSubscriptions(
-			{ timeline: timeline, repositories: repositories, subscription: subscription, config: config },
-			subActions,
-		);
+		// Recreated per ready (not `??=`): the subscriber closes over this session's actions — see
+		// the equivalent note in commitDetails.ts.
+		this._eventsSubscription?.unsubscribe();
+		this._eventsSubscription = setupSubscriptions(this._rpc.connection!, subActions);
+		// Wait for the subscriptions to land before the initial fetch below, preserving the
+		// subscribe-before-fetch guarantee (`ready` settles once, so reconnects don't re-wait).
+		await this._eventsSubscription.ready;
 
 		// Cancel pending RPC requests on hide (responses would be silently dropped
 		// by VS Code); re-fetch data on visibility restore

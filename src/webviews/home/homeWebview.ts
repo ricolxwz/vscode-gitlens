@@ -20,10 +20,8 @@ import { filterMap } from '@gitlens/utils/iterable.js';
 import { hasKeys } from '@gitlens/utils/object.js';
 import { getSettledValue } from '@gitlens/utils/promise.js';
 import { SubscriptionManager } from '@gitlens/utils/subscriptionManager.js';
-import type { AgentSessionState } from '../../agents/models/agentSessionState.js';
 import { ActionRunnerType } from '../../api/actionRunners.js';
 import type { CreatePullRequestActionContext } from '../../api/gitlens.d.js';
-import { getAvatarUriFromGravatarEmail } from '../../avatars.js';
 import type { ComposerCommandArgs } from '../../commands/composer.js';
 import type { ExplainBranchCommandArgs } from '../../commands/explainBranch.js';
 import type { ExplainWipCommandArgs } from '../../commands/explainWip.js';
@@ -104,9 +102,7 @@ import type {
 	OverviewFilters,
 	OverviewRepository,
 	State,
-	SubscriptionState,
 } from './protocol.js';
-import { DidChangeSubscription } from './protocol.js';
 import type { HomeWebviewShowingArgs } from './registration.js';
 
 interface RepositoryBranchData {
@@ -229,37 +225,6 @@ export class HomeWebviewProvider implements WebviewProvider<State, State, HomeWe
 			// --- UI Actions ---
 			openInGraph: params => this.showInCommitGraph(params),
 			onFocusAccount: this._focusAccountEvent.subscribe(buffer, tracker),
-
-			// --- Agent Sessions ---
-			getAgentSessions: () => Promise.resolve(this.container.agentStatus?.getSerializedSessions() ?? []),
-			onAgentSessionsChanged: createRpcEventSubscription<AgentSessionState[]>(
-				buffer,
-				'agentSessions',
-				'save-last',
-				buffered => {
-					let serviceSubscription: Disposable | undefined;
-
-					const wire = () => {
-						serviceSubscription?.dispose();
-						serviceSubscription = this.container.agentStatus?.onDidChangeSessions(state => buffered(state));
-					};
-
-					wire();
-					const containerSubscription = this.container.onDidChangeAgentStatus(() => {
-						wire();
-						// Push a fresh snapshot so subscribers see the new (or empty) sessions
-						buffered(this.container.agentStatus?.getSerializedSessions() ?? []);
-					});
-
-					return Disposable.from(containerSubscription, {
-						dispose: () => {
-							serviceSubscription?.dispose();
-						},
-					});
-				},
-				undefined,
-				tracker,
-			),
 
 			// --- Initial Context ---
 			getInitialContext: () =>
@@ -727,10 +692,10 @@ export class HomeWebviewProvider implements WebviewProvider<State, State, HomeWe
 	}
 
 	@trace({ args: false })
-	private async onSubscriptionChanged(e: SubscriptionChangeEvent) {
+	private onSubscriptionChanged(e: SubscriptionChangeEvent) {
 		if (e.etag === this._etagSubscription) return;
 
-		await this.notifyDidChangeSubscription(e.current);
+		this._etagSubscription = e.etag;
 
 		if (
 			isSubscriptionTrialOrPaidFromState(e.current.state) !== isSubscriptionTrialOrPaidFromState(e.previous.state)
@@ -1081,25 +1046,6 @@ export class HomeWebviewProvider implements WebviewProvider<State, State, HomeWe
 		return isSubscriptionTrialOrPaidFromState(subscription.state);
 	}
 
-	private async getSubscriptionState(subscription?: Subscription): Promise<SubscriptionState> {
-		subscription = await this.getSubscription(subscription);
-		this._etagSubscription = this.container.subscription.etag;
-
-		let avatar;
-		if (subscription.account?.email) {
-			avatar = getAvatarUriFromGravatarEmail(subscription.account.email, 34).toString();
-		} else {
-			avatar = `${this.host.getWebRoot() ?? ''}/media/gitlens-logo.webp`;
-		}
-
-		return {
-			subscription: subscription,
-			avatar: avatar,
-			organizationsCount:
-				subscription != null ? ((await this.container.organizations.getOrganizations()) ?? []).length : 0,
-		};
-	}
-
 	private getWalkthroughProgress(): State['walkthroughProgress'] {
 		if (this.getWalkthroughDismissed()) return undefined;
 
@@ -1140,16 +1086,6 @@ export class HomeWebviewProvider implements WebviewProvider<State, State, HomeWe
 		if (integrations.some(i => i.connected)) {
 			void this.container.onboarding.dismiss('home:integrationBanner').catch();
 		}
-	}
-
-	private async notifyDidChangeSubscription(subscription?: Subscription) {
-		const subResult = await this.getSubscriptionState(subscription);
-
-		void this.host.notify(DidChangeSubscription, {
-			subscription: subResult.subscription,
-			avatar: subResult.avatar,
-			organizationsCount: subResult.organizationsCount,
-		});
 	}
 
 	@command('gitlens.deleteBranchOrWorktree:')

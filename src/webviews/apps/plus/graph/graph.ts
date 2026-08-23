@@ -1,4 +1,7 @@
 import './graph.scss';
+import type { Remote, Subscription } from '@eamodio/supertalk';
+import { subscribe } from '@eamodio/supertalk';
+import { SequencedChannel } from '@eamodio/supertalk-core/handlers/channel.js';
 import { ContextProvider } from '@lit/context';
 import { html } from 'lit';
 import { customElement, query, state } from 'lit/decorators.js';
@@ -9,10 +12,14 @@ import type {
 	DidRequestOpenCompareModeParams,
 	DidRequestOpenTimelineScopeParams,
 	DidRequestSearchParams,
+	GraphRowsPayload,
 	State,
 } from '../../../plus/graph/protocol.js';
+import type { AgentInfo } from '../../../rpc/services/types.js';
+import { sortAgentSessions } from '../../shared/agentUtils.js';
 import { GlAppHost } from '../../shared/appHost.js';
 import { createOnboardingDismissals, onboardingDismissalsContext } from '../../shared/contexts/onboardingDismissals.js';
+import { subscribeAll } from '../../shared/events/subscriptions.js';
 import type { HostIpc } from '../../shared/ipc.js';
 import { RpcController } from '../../shared/rpc/rpcController.js';
 import type { ThemeChangeEvent } from '../../shared/theme.js';
@@ -26,6 +33,18 @@ import { sidebarActionsContext } from './sidebar/sidebarContext.js';
 import { createSidebarActions } from './sidebar/sidebarState.js';
 import { GraphStateProvider } from './stateProvider.js';
 import './graph-app.js';
+
+/** Derives the hooks-install capability from the shared agent list — CLI rows only, stripped of the
+ *  `cli:` id prefix the settings table dispatch expects but the graph consumers never carried. */
+function computeHooksAgents(infos: readonly AgentInfo[]): { id: string; displayName: string; installed: boolean }[] {
+	const result: { id: string; displayName: string; installed: boolean }[] = [];
+	for (const a of infos) {
+		if (a.kind !== 'cli' || a.detected !== true || a.hooks?.supported !== true) continue;
+
+		result.push({ id: a.id.replace(/^cli:/, ''), displayName: a.label, installed: a.hooks.installed });
+	}
+	return result;
+}
 
 @customElement('gl-graph-apphost')
 export class GraphAppHost extends GlAppHost<State, GraphStateProvider> {
@@ -52,12 +71,9 @@ export class GraphAppHost extends GlAppHost<State, GraphStateProvider> {
 		initialValue: this._searchActions,
 	});
 
-	/** Unsubscribes the current `onDidRequestSearch` listener — reconnect-safe teardown, same pattern as
-	 *  `_sidebarActions.initialize()`'s own subscriptions. */
-	private _unsubscribeRequestSearch: (() => void) | undefined;
-	/** The search remote `_unsubscribeRequestSearch` currently belongs to — lets a superseding
-	 *  `_onRpcReady` (reconnect) detect and discard a subscribe that resolves after it's moved on. */
-	private _activeSearchRemote: unknown;
+	/** The event subscriptions armed once (per app-element lifetime) by `armSubscriptions()` — the
+	 *  library re-runs each subscriber on every handshake, so nothing is re-wired in `_onRpcReady`. */
+	private _subscriptions: Subscription[] | undefined;
 
 	private readonly _onboardingDismissals = createOnboardingDismissals();
 
@@ -81,38 +97,176 @@ export class GraphAppHost extends GlAppHost<State, GraphStateProvider> {
 		initialValue: undefined,
 	});
 
+	// The rows plane's inbound channel. Declared BEFORE `_rpc` so it exists when the controller builds
+	// its client, and reused across reconnects — each session resets the Connection, which cycles this
+	// channel's disconnect/connect and clears its inbound generation before the next handshake.
+	private readonly _rowsChannel = new SequencedChannel<GraphRowsPayload>('graph:rows', { replay: 0 });
+
 	private _rpc = new RpcController<GraphServices>(this, {
 		onReady: services => this._onRpcReady(services),
+		rpcOptions: { handlers: [this._rowsChannel] },
 	});
 
-	private async _onRpcReady(services: import('@eamodio/supertalk').Remote<GraphServices>): Promise<void> {
-		this._servicesProvider.setValue(services);
+	/** Arms the RPC event subscriptions once. The library re-runs each subscriber on every
+	 *  successful handshake (including reconnects), so there's no per-mount re-wiring or staleness
+	 *  guard to maintain — a `reset()` just rejects any in-flight call in the subscriber with a
+	 *  swallowed `ConnectionClosedError`, and the next handshake replays subscribe-then-seed. */
+	private armSubscriptions(): void {
+		if (this._subscriptions != null) return;
 
-		this._onboardingDismissals.connect(services.onboarding);
-		this._coachMarkSeen.connect(services.onboarding);
+		const connection = this._rpc.connection!;
+
+		this._subscriptions = [
+			subscribe<GraphServices>(connection, async services => {
+				const search = await services.search;
+				return subscribeAll([
+					() =>
+						search.onDidRequestSearch(params => {
+							this.dispatchEvent(
+								new CustomEvent('gl-graph-request-search', { detail: params, bubbles: true }),
+							);
+						}),
+				]);
+			}),
+
+			subscribe<GraphServices>(connection, async services => {
+				const agents = await services.agents;
+
+				// Subscribe before fetching so no snapshot fired between subscribe and fetch is ever lost.
+				const unsub = await subscribeAll([
+					() =>
+						agents.onSessionsChanged(sessions => {
+							this._stateProvider.agentSessions = sortAgentSessions(sessions);
+						}),
+					() =>
+						agents.onAgentsChanged(infos => {
+							this.applyAgentsInfo(infos);
+						}),
+				]);
+
+				const sessions = await agents.getSessions();
+				this._stateProvider.agentSessions = sortAgentSessions(sessions);
+				const infos = await agents.getAgents();
+				this.applyAgentsInfo(infos);
+
+				return unsub;
+			}),
+
+			// Agents-banner: bridge the onboarding RPC service's per-key dismissal event into the
+			// stateProvider slot `sidebar-panel.ts` reads. `isWeb` forces collapsed (agents are fully
+			// disabled on web hosts) — mirrors the legacy host's `isAgentsBannerEnabled`.
+			subscribe<GraphServices>(connection, async services => {
+				const onboarding = await services.onboarding;
+
+				// Subscribe before fetching so no snapshot fired between subscribe and fetch is ever lost.
+				const unsub = await subscribeAll([
+					() =>
+						onboarding.onDidChange(e => {
+							if (e.key !== 'agents:banner') return;
+
+							this._stateProvider.applyAgentsBannerCollapsed(
+								this._stateProvider.isWeb === true || e.dismissed,
+							);
+						}),
+				]);
+
+				// oxlint-disable-next-line typescript/await-thenable -- Supertalk proxy method calls are thenable at runtime
+				const dismissed = await onboarding.isDismissed('agents:banner');
+				this._stateProvider.applyAgentsBannerCollapsed(this._stateProvider.isWeb === true || dismissed);
+
+				return unsub;
+			}),
+
+			// Walkthrough-started: bridge the telemetry RPC service's per-key usage-change event into the
+			// stateProvider slot `walkthroughBanner.ts` reads via `graphState.graphWalkthroughStarted`.
+			subscribe<GraphServices>(connection, async services => {
+				const telemetry = await services.telemetry;
+
+				// Subscribe before fetching so no snapshot fired between subscribe and fetch is ever lost.
+				const unsub = await subscribeAll([
+					() =>
+						telemetry.onUsageChanged(e => {
+							if (e.key !== 'action:gitlens.graph.walkthrough.started:happened') return;
+
+							this._stateProvider.applyGraphWalkthroughStarted(e.used);
+						}),
+				]);
+
+				const walkthroughStarted = await telemetry.isUsed('action:gitlens.graph.walkthrough.started:happened');
+				this._stateProvider.applyGraphWalkthroughStarted(walkthroughStarted);
+
+				return unsub;
+			}),
+
+			// Bridges the access plane (subscription + `allowed` + feature preview) into the state
+			// provider. Gating runs on its own track — armed here rather than in the long await chain
+			// in `_onRpcReady`, so it never delays (or, via one of that chain's early returns, skips)
+			// the access snapshot the walls are rendered from. A failed subscriber leaves the bootstrap
+			// state's first-render values in place; the connection logger reports the failure.
+			subscribe<GraphServices>(connection, async services => {
+				const access = await services.access;
+
+				// Subscribe before fetching so no snapshot fired between subscribe and fetch is ever lost.
+				const unsub = await subscribeAll([
+					() =>
+						access.onAccessChanged(state => {
+							this._stateProvider.applyAccess(state);
+						}),
+				]);
+
+				const state = await access.getAccess();
+				this._stateProvider.applyAccess(state);
+
+				return unsub;
+			}),
+
+			// Bridges the active repo's last-fetched time into the state provider. Same "own track"
+			// reasoning as the access plane above — the header's "Last fetched" label shouldn't wait on
+			// the long await chain in `_onRpcReady`.
+			subscribe<GraphServices>(connection, async services => {
+				const repoStatus = await services.repoStatus;
+
+				// Subscribe before fetching so no snapshot fired between subscribe and fetch is ever lost.
+				const unsub = await subscribeAll([
+					() =>
+						repoStatus.onDidFetch(status => {
+							this._stateProvider.applyLastFetched(status.repoPath, status.lastFetched);
+						}),
+				]);
+
+				const status = await repoStatus.getLastFetched();
+				if (status != null) {
+					this._stateProvider.applyLastFetched(status.repoPath, status.lastFetched);
+				}
+
+				return unsub;
+			}),
+		];
+	}
+
+	private async _onRpcReady(services: Remote<GraphServices>): Promise<void> {
+		this.armSubscriptions();
+
+		this._servicesProvider.setValue(services);
+		this._stateProvider.initializeServices(this._rpc.connection!);
+
+		this._onboardingDismissals.connect(this._rpc.connection!);
+		this._coachMarkSeen.connect(this._rpc.connection!);
+		this._promos.connect(this._rpc.connection!);
 
 		const sidebar = await services.sidebar;
 		this._sidebarActions.initialize(sidebar);
 
-		const search = await services.search;
-		this._searchActions.initialize(search, this._stateProvider);
+		const [search, pickers] = await Promise.all([services.search, services.pickers]);
+		this._searchActions.initialize(search, this._stateProvider, pickers);
+	}
 
-		// Tear down the previous listener first — reconnect-safe, same pattern as `_sidebarActions.initialize()`.
-		this._unsubscribeRequestSearch?.();
-		this._unsubscribeRequestSearch = undefined;
-		this._activeSearchRemote = search;
-
-		const unsub = (await search.onDidRequestSearch(params => {
-			this.dispatchEvent(new CustomEvent('gl-graph-request-search', { detail: params, bubbles: true }));
-		})) as unknown as (() => void) | undefined;
-		if (typeof unsub !== 'function') return;
-
-		if (this._activeSearchRemote !== search) {
-			unsub();
-			return;
-		}
-
-		this._unsubscribeRequestSearch = unsub;
+	private applyAgentsInfo(infos: readonly AgentInfo[]): void {
+		const hooksAgents = computeHooksAgents(infos);
+		this._stateProvider.applyHooksCapability(
+			hooksAgents.some(a => !a.installed),
+			hooksAgents,
+		);
 	}
 
 	@query('gl-graph-app')
@@ -169,8 +323,9 @@ export class GraphAppHost extends GlAppHost<State, GraphStateProvider> {
 		this.removeEventListener('gl-graph-request-reveal-failed', this._handleRequestRevealFailed as EventListener);
 		this._sidebarActions.dispose();
 		this._searchActions.dispose();
-		this._unsubscribeRequestSearch?.();
-		this._unsubscribeRequestSearch = undefined;
+		// `_subscriptions` are intentionally left armed on unmount: the controller's `hostDisconnected`
+		// ends the RPC session (host-side subscription state dies with it), and the library re-issues
+		// each subscriber on the next handshake — there's nothing here to unsubscribe.
 		this._onboardingDismissals.dispose();
 		this._coachMarkSeen.dispose();
 	}
@@ -201,6 +356,7 @@ export class GraphAppHost extends GlAppHost<State, GraphStateProvider> {
 
 	protected override createStateProvider(bootstrap: string, ipc: HostIpc): GraphStateProvider {
 		return new GraphStateProvider(this, bootstrap, ipc, this._logger, {
+			rowsChannel: this._rowsChannel,
 			onStateUpdate: partial => {
 				if ('rows' in partial) {
 					this.appElement.resetHover();

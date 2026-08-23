@@ -1,6 +1,6 @@
 import { Disposable, env } from 'vscode';
 import type { GkAgent } from '../../../agents/agentService.js';
-import type { PastAgentSessionsResult } from '../../../agents/models/agentSessionState.js';
+import type { AgentSessionState, PastAgentSessionsResult } from '../../../agents/models/agentSessionState.js';
 import { areHooksAllowedForAgent } from '../../../agents/utils/agentHooks.js';
 import type { Container } from '../../../container.js';
 import type { AgentDescriptor } from '../../../plus/agents/agentDescriptor.js';
@@ -54,6 +54,9 @@ export class AgentsService {
 	/** Fired when the detected-agent list or the default agent changes. */
 	readonly onAgentsChanged: RpcEventSubscription<AgentInfo[]>;
 
+	/** Fired when live agent sessions change, including a full resync when `agentStatus` itself swaps. */
+	readonly onSessionsChanged: RpcEventSubscription<AgentSessionState[]>;
+
 	constructor(
 		private readonly container: Container,
 		buffer?: EventVisibilityBuffer,
@@ -64,18 +67,6 @@ export class AgentsService {
 			'agentsChanged',
 			'save-last',
 			buffered => {
-				let hooksSubscription: Disposable | undefined;
-
-				// `container.agentStatus` is created/disposed asynchronously by the container; resubscribe
-				// on the container's healing signal instead of latching a one-shot reference.
-				const wireHooksSubscription = () => {
-					hooksSubscription?.dispose();
-					hooksSubscription = this.container.agentStatus?.onDidChangeHooksInstallState(() => {
-						void this.getAgents().then(buffered);
-					});
-				};
-				wireHooksSubscription();
-
 				return Disposable.from(
 					configuration.onDidChange(e => {
 						if (configuration.changed(e, 'ai.defaultAgent')) {
@@ -90,27 +81,72 @@ export class AgentsService {
 					this.container.agents.onDidChangeAgents(() => {
 						void this.getAgents().then(buffered);
 					}),
-					this.container.onDidChangeAgentStatus(() => {
-						wireHooksSubscription();
-						void this.getAgents().then(buffered);
-					}),
-					{
-						dispose: () => {
-							hooksSubscription?.dispose();
-						},
-					},
+					this.subscribeAcrossAgentStatusSwaps(
+						agentStatus =>
+							agentStatus.onDidChangeHooksInstallState(() => {
+								void this.getAgents().then(buffered);
+							}),
+						() => void this.getAgents().then(buffered),
+					),
 				);
 			},
 			undefined,
 			tracker,
 		);
+
+		this.onSessionsChanged = createRpcEventSubscription<AgentSessionState[]>(
+			buffer,
+			'agentSessionsChanged',
+			'save-last',
+			buffered =>
+				this.subscribeAcrossAgentStatusSwaps(
+					agentStatus => agentStatus.onDidChangeSessions(state => buffered(state)),
+					// Push a fresh snapshot so subscribers see the new (or empty) sessions
+					() => buffered(this.container.agentStatus?.getSerializedSessions() ?? []),
+				),
+			undefined,
+			tracker,
+		);
+	}
+
+	/** Subscribes to a `container.agentStatus`-owned emitter, resubscribing whenever the container
+	 *  swaps the service (it's created/disposed asynchronously) — a latched one-shot reference would
+	 *  go deaf on the swap. `onSwap` runs after each rewire so the subscriber can re-seed. */
+	private subscribeAcrossAgentStatusSwaps(
+		subscribe: (agentStatus: NonNullable<Container['agentStatus']>) => Disposable,
+		onSwap: () => void,
+	): Disposable {
+		let subscription: Disposable | undefined;
+
+		const wire = () => {
+			subscription?.dispose();
+			const agentStatus = this.container.agentStatus;
+			subscription = agentStatus != null ? subscribe(agentStatus) : undefined;
+		};
+
+		wire();
+		const containerSubscription = this.container.onDidChangeAgentStatus(() => {
+			wire();
+			onSwap();
+		});
+
+		return Disposable.from(containerSubscription, {
+			dispose: () => {
+				subscription?.dispose();
+			},
+		});
+	}
+
+	/** Gets current live agent sessions. */
+	getSessions(): Promise<AgentSessionState[]> {
+		return Promise.resolve(this.container.agentStatus?.getSerializedSessions() ?? []);
 	}
 
 	/**
 	 * Gets the past sessions a worktree can resume, most-recently-active first.
 	 *
-	 * Past sessions only — live ones already reach webviews on a push channel, and a snapshot taken
-	 * here would disagree with it within seconds.
+	 * Past sessions only — live sessions come from {@link getSessions}/{@link onSessionsChanged}
+	 * instead, and a snapshot taken here would disagree with that push channel within seconds.
 	 *
 	 * Returns `undefined` when agents are unavailable (the org gate is off, or we're in a browser
 	 * host, where no providers exist) as distinct from an empty result, which means the store simply

@@ -10,6 +10,7 @@ import type { GitGraphRow, GitGraphRowKind } from '@gitlens/git/models/graph.js'
 import { uncommitted } from '@gitlens/git/models/revision.js';
 import type { GitCommitReachability } from '@gitlens/git/providers/commits.js';
 import { areEqual as areArraysEqual } from '@gitlens/utils/array.js';
+import { debounce } from '@gitlens/utils/debounce.js';
 import { areEqual } from '@gitlens/utils/object.js';
 import type { GraphBranchesVisibility } from '../../../../../config.js';
 import type { CommitDetails } from '../../../../commitDetails/protocol.js';
@@ -17,6 +18,7 @@ import type {
 	DidLoadRowParams,
 	GraphAvatars,
 	GraphColumnName,
+	GraphColumnsConfig,
 	GraphMissingRefsMetadata,
 	GraphRef,
 	GraphRefMetadataItem,
@@ -28,32 +30,13 @@ import type {
 	GraphWipRowsById,
 	GraphWipStateById,
 	GraphZoneType,
-	ProxyAvatarsParams,
 	ReadonlyGraphRow,
 	RowAction,
 	SelectCommitsOptions,
 } from '../../../../plus/graph/protocol.js';
-import {
-	CancelLoadRowCommand,
-	createWipRowId,
-	DoubleClickedCommand,
-	GetMissingAvatarsCommand,
-	GetMissingRefsMetadataCommand,
-	GetMoreRowsCommand,
-	getWipRowWorktreePath,
-	GetWipStatsRequest,
-	isWipRowId,
-	LoadRowRequest,
-	ProxyAvatarsCommand,
-	RowActionCommand,
-	SyncWipWatchesCommand,
-	UpdateColumnsCommand,
-	UpdatePinnedRefCommand,
-	UpdateSelectionCommand,
-} from '../../../../plus/graph/protocol.js';
+import { createWipRowId, getWipRowWorktreePath, isWipRowId } from '../../../../plus/graph/protocol.js';
+import { fireAndForget, noop, notifyService } from '../../../shared/actions/rpc.js';
 import { indexAgentSessionsByRepoAndWorktree, matchAgentSessionsForWorktree } from '../../../shared/agentUtils.js';
-import type { CustomEventType } from '../../../shared/components/element.js';
-import { ipcContext } from '../../../shared/contexts/ipc.js';
 import type { TelemetryContext } from '../../../shared/contexts/telemetry.js';
 import { telemetryContext } from '../../../shared/contexts/telemetry.js';
 import type { KeymapDispatcher } from '../../../shared/keymap/keymapDispatcher.js';
@@ -61,7 +44,7 @@ import type { AnchorKey } from '../components/anchorKey.js';
 import type { RunningOperationBucket } from '../components/detailsState.js';
 import type { WipRowAgentStatus } from '../components/wipRowAgentStatus.js';
 import { pickWipRowAgentStatus } from '../components/wipRowAgentStatus.js';
-import { graphStateContext } from '../context.js';
+import { graphServicesContext, graphStateContext } from '../context.js';
 import type { GraphCrossPaneState } from '../graphCrossPaneState.js';
 import { graphCrossPaneContext } from '../graphCrossPaneState.js';
 import { getGraphDebugDiagnostics } from '../graphDebugDiagnostics.js';
@@ -179,9 +162,11 @@ type GraphRevealIntent = { mode: GraphRevealMode; flash: boolean };
 
 type PendingGraphNavigation = {
 	abortCleanup?: () => void;
-	/** Set when this navigation issued a host `LoadRowRequest` — the host walk it started is UNCAPPED,
+	/** Set when this navigation issued a host `rows.loadRow` — the host walk it started is UNCAPPED,
 	 *  so settling without a hit has to withdraw it (see {@link settlePendingNavigation}). */
 	hostLoadSha?: string;
+	/** Withdraws the {@link hostLoadSha} walk. Paired with `hostLoadSha`, set at the same moment. */
+	hostLoadAbort?: AbortController;
 	debugMark?: string;
 	deferSynthetic: boolean;
 	/** Whether a failure here is reportable — see {@link GraphNavigationOptions.feedback}. */
@@ -220,7 +205,7 @@ const maxUnreachableAnchorPageAttempts = 3;
 const wipStatsMaxRetries = 2;
 const wipStatsRetryDelayMs = 2000;
 
-/** How the host explained a {@link LoadRowRequest} that came back without a row — an unloadable ref, a
+/** How the host explained a `rows.loadRow` that came back without a row — an unloadable ref, a
  *  commit only reachable off the first-parent walk, or a plain miss. */
 function toNavigationFailureReason(result: DidLoadRowParams | undefined): GraphNavigationFailureReason {
 	if (result?.error != null) return { kind: 'error', message: result.error };
@@ -440,8 +425,8 @@ export class GlGraphWrapper extends SignalWatcher(LitElement) {
 	@consume({ context: graphCrossPaneContext })
 	private readonly _crossPaneState!: GraphCrossPaneState;
 
-	@consume({ context: ipcContext })
-	private readonly _ipc!: typeof ipcContext.__context__;
+	@consume({ context: graphServicesContext, subscribe: true })
+	private services?: typeof graphServicesContext.__context__;
 
 	@consume({ context: telemetryContext as any })
 	private readonly _telemetry!: TelemetryContext;
@@ -537,6 +522,9 @@ export class GlGraphWrapper extends SignalWatcher(LitElement) {
 		document.removeEventListener('gl-jump-to-nearest-wip', this.onJumpToNearestWip as EventListener);
 		document.removeEventListener('gl-jump-to-commit', this.onJumpToCommit as EventListener);
 		this.cancelPendingSelection();
+		// Flush, not cancel: the RPC channel outlives this element (a mode switch detaches it), so the
+		// pending report is still deliverable — and dropping it would strand the host on a stale row.
+		this.sendSelectionDebounced.flush();
 		// Nothing will replay it, and a remount starts from whatever the host then pushes.
 		this._deferredMoreRows = undefined;
 		if (this._clearRowContextTimer != null) {
@@ -1212,7 +1200,7 @@ export class GlGraphWrapper extends SignalWatcher(LitElement) {
 			.config=${graphState.config}
 			.downstreams=${graphState.downstreams}
 			.columns=${graphState.columns}
-			.columnsRevision=${graphState.columnsRevision ?? 0}
+			.persistColumns=${this.persistColumns}
 			.activeFilterColumns=${graphState.activeFilterColumns}
 			.repoPath=${this.getRepoPath()}
 			.columnsContext=${graphState.context?.header}
@@ -1247,7 +1235,6 @@ export class GlGraphWrapper extends SignalWatcher(LitElement) {
 			@gl-graph-avatarloaderror=${this.onGraphAvatarLoadError}
 			@gl-graph-missingrefsmetadata=${this.onGraphMissingRefsMetadata}
 			@gl-graph-scopeanchorsunreachable=${this.onScopeAnchorsUnreachable}
-			@gl-graph-changecolumns=${this.onColumnsChanged}
 			@gl-graph-rowhoverstart=${this.onGraphRowHoverStart}
 			@gl-graph-rowhovertrack=${this.onGraphRowHoverTrack}
 			@gl-graph-rowhover=${this.onGraphRowHover}
@@ -1371,7 +1358,7 @@ export class GlGraphWrapper extends SignalWatcher(LitElement) {
 
 	selectCommits(shas: string[], options?: SelectCommitsOptions): ReadonlyGraphRow[] {
 		// A direct selection is newer user/app intent than any queued targeted navigation. Without this,
-		// details/minimap selections can be overwritten when an older LoadRowRequest finally renders.
+		// details/minimap selections can be overwritten when an older `rows.loadRow` finally renders.
 		this.cancelPendingSelection();
 		const rows = this.selectCommitsCore(shas);
 		// `ensureVisible` is opt-in: scroll the (first) selected row into view ONLY when the caller asks
@@ -1457,7 +1444,10 @@ export class GlGraphWrapper extends SignalWatcher(LitElement) {
 		);
 
 		this._lastSentSelectionKey = selection.map(s => `${s.id}|${s.active ? 1 : 0}|${s.hidden ? 1 : 0}`).join(',');
-		this._ipc.sendCommand(UpdateSelectionCommand, { selection: selection });
+		// Undebounced: search navigation is one-shot, so there is nothing to coalesce with — and the
+		// selection it just wrote must reach the host before any follow-up acts on it.
+		this.sendSelectionDebounced.cancel();
+		this.sendSelection(selection);
 
 		// Matched rows are loaded; report `hidden` from the displayed set (see getCommits) so the search-nav
 		// "result hidden" warning fires for a loaded-but-not-displayed match.
@@ -1511,7 +1501,7 @@ export class GlGraphWrapper extends SignalWatcher(LitElement) {
 		// nobody awaits — withdraw it. Harmless if the host already finished: it only cancels a query still
 		// matching this id.
 		if (pending.hostLoadSha != null && result.status !== 'selected') {
-			this._ipc.sendCommand(CancelLoadRowCommand, { id: pending.hostLoadSha });
+			pending.hostLoadAbort?.abort();
 		}
 		// A row that can't be found won't become renderable on its own, so drop a host highlight request
 		// naming it. Keyed to this sha, and never on 'cancelled' — there a newer owner has taken over and
@@ -1896,16 +1886,17 @@ export class GlGraphWrapper extends SignalWatcher(LitElement) {
 			const anchorSha = this.graphState.wipRowsById?.[sha]?.parentSha;
 			if (anchorSha != null && rowBySha?.get(anchorSha) == null) {
 				this._endEnsureLoading = this.graphState.beginEnsureLoading();
+				const abort = new AbortController();
 				if (this._pendingNavigation?.generation === generation) {
 					this._pendingNavigation.hostLoadSha = anchorSha;
+					this._pendingNavigation.hostLoadAbort = abort;
 				}
 				this.dispatchEvent(
 					new CustomEvent('gl-graph-navigation-loading', {
 						detail: { sha: sha, ref: ref, feedback: feedback },
 					}),
 				);
-				void this._ipc
-					.sendRequest(LoadRowRequest, { id: anchorSha })
+				void this.loadRowFromHost(anchorSha, abort.signal)
 					.then(result => {
 						// The anchor never arrives ⇒ the WIP row cannot be synthesized; fail now rather
 						// than let the deferred intent sit until it times out.
@@ -1924,14 +1915,15 @@ export class GlGraphWrapper extends SignalWatcher(LitElement) {
 		}
 
 		this._endEnsureLoading = this.graphState.beginEnsureLoading();
+		const abort = new AbortController();
 		if (this._pendingNavigation?.generation === generation) {
 			this._pendingNavigation.hostLoadSha = sha;
+			this._pendingNavigation.hostLoadAbort = abort;
 		}
 		this.dispatchEvent(
 			new CustomEvent('gl-graph-navigation-loading', { detail: { sha: sha, ref: ref, feedback: feedback } }),
 		);
-		void this._ipc
-			.sendRequest(LoadRowRequest, { id: sha })
+		void this.loadRowFromHost(sha, abort.signal)
 			.then(result => {
 				if (result?.id !== sha) {
 					this.rejectPendingNavigation(generation, toNavigationFailureReason(result));
@@ -1949,12 +1941,27 @@ export class GlGraphWrapper extends SignalWatcher(LitElement) {
 		litGraph?.scrollToSha(sha, reveal);
 		return navigation;
 	}
-	private onColumnsChanged(event: CustomEventType<'gl-graph-changecolumns'>) {
-		this._ipc.sendCommand(UpdateColumnsCommand, {
-			config: event.detail.settings,
-			revision: event.detail.revision,
-		});
+
+	/** Asks the host to page a row in, aborting the (uncapped) walk when `signal` fires. Returns
+	 *  `undefined` only when the services aren't wired yet, which the callers read as a plain miss. */
+	private async loadRowFromHost(id: string, signal: AbortSignal): Promise<DidLoadRowParams | undefined> {
+		const services = this.services;
+		if (services == null) return undefined;
+
+		return (await services.rows).loadRow(id, signal);
 	}
+
+	/**
+	 * Persists a columns write via RPC, resolving once the host's storage write has landed. The graph
+	 * component awaits this to know when its own write stops being outstanding — see
+	 * `shouldApplyIncomingColumns`. A bound field so the prop identity is stable across renders.
+	 */
+	private readonly persistColumns = async (config: GraphColumnsConfig): Promise<void> => {
+		const services = this.services;
+		if (services == null) return;
+
+		await (await services.columns).setColumns(config);
+	};
 
 	private onMouseLeave() {
 		this.dispatchEvent(new CustomEvent('gl-graph-mouse-leave'));
@@ -1965,6 +1972,9 @@ export class GlGraphWrapper extends SignalWatcher(LitElement) {
 	private onGraphRowAction({
 		detail: { action, sha, type, worktreePath },
 	}: CustomEvent<{ action: RowAction; sha: string; type: GitGraphRowKind; worktreePath?: string }>) {
+		const services = this.services;
+		if (services == null) return;
+
 		const rowRef = { id: sha, type: type };
 		// Narrow per-action so the discriminated `RowActionParams` only carries the fields its case
 		// allows — keeps stash/open-changes payloads from accidentally inheriting worktreePath.
@@ -1972,15 +1982,18 @@ export class GlGraphWrapper extends SignalWatcher(LitElement) {
 			action === 'undo-commit'
 				? { action: action, row: rowRef, worktreePath: worktreePath }
 				: { action: action, row: rowRef };
-		this._ipc.sendCommand(RowActionCommand, params);
+		notifyService(services.rowActions, 'rowActions/execute', svc => svc.executeRowAction(params));
 	}
 
-	/** Ref pill's pin zone → clear the edge pin. Goes through `UpdatePinnedRefCommand` (the host's own
-	 *  pinned-ref channel) rather than executing `gitlens.graph.unpinBranchFromEdge`: the command takes no
-	 *  meaningful payload beyond the session it runs in, and the sidebar's generic action channel re-stamps
-	 *  telemetry origin as `sidebar-inline`, which would misattribute a graph-body click. */
+	/** Ref pill's pin zone → clear the edge pin. Goes through the filters service's own pinned-ref write
+	 *  rather than executing `gitlens.graph.unpinBranchFromEdge`: the command takes no meaningful payload
+	 *  beyond the session it runs in, and the sidebar's generic action channel re-stamps telemetry origin
+	 *  as `sidebar-inline`, which would misattribute a graph-body click. */
 	private onGraphUnpinRef() {
-		this._ipc.sendCommand(UpdatePinnedRefCommand, { ref: null });
+		const services = this.services;
+		if (services == null) return;
+
+		notifyService(services.filters, 'filters/pinnedRef', svc => svc.setPinnedRef(null));
 	}
 
 	// New-engine WIP row-open button (resolve/compose/review/agents) → look the full row up by sha and
@@ -2230,8 +2243,33 @@ export class GlGraphWrapper extends SignalWatcher(LitElement) {
 
 	private _lastSentSelectionKey: string | undefined;
 
+	/** Ships one selection report to the host as a one-way notify: a click must never wait on an ack.
+	 *  `updateSelection`'s return is never read host-side; errors on either side now surface via the
+	 *  connection's logger instead of an awaited/discarded promise. */
+	private sendSelection(selection: GraphSelection[]): void {
+		const services = this.services;
+		if (services == null) return;
+
+		notifyService(services.selection, 'selection/update', svc => svc.updateSelection(selection));
+	}
+
 	/**
-	 * SHAs we've already issued `GetMoreRowsCommand({ id: sha })` for via the unreachable-anchor
+	 * Coalescer for the user-intent path, on the APP side of the wire — an arrow-key scrub fires one
+	 * report per row and only the row the user lands on matters to the host. Trailing-edge only, so the
+	 * FINAL selection always wins; `maxWait` bounds how stale the host's paging hint and palette-command
+	 * fallback can get while a key is held. The search-navigation path deliberately bypasses this: it's
+	 * one-shot, so there is nothing to coalesce with.
+	 */
+	private readonly sendSelectionDebounced = debounce(
+		(selection: GraphSelection[]) => this.sendSelection(selection),
+		50,
+		{
+			maxWait: 250,
+		},
+	);
+
+	/**
+	 * SHAs we've already issued `rows.getMoreRows(sha)` for via the unreachable-anchor
 	 * path, mapped to the loaded row count at the time the request was sent plus how many targeted
 	 * walks that SHA has cost. If a targeted walk returns without surfacing the SHA, we park it here
 	 * so the next `scopeanchorsunreachable` event doesn't re-fire the same request immediately.
@@ -2429,11 +2467,11 @@ export class GlGraphWrapper extends SignalWatcher(LitElement) {
 
 		this._lastSentSelectionKey = selectionKey;
 
-		this._ipc.sendCommand(UpdateSelectionCommand, { selection: selection });
+		this.sendSelectionDebounced(selection);
 	}
 
 	private onGraphRowDoubleClick(event: CustomEvent<{ sha: string; type: GitGraphRow['kind'] }>) {
-		const { sha, type } = event.detail;
+		const { sha } = event.detail;
 		// Resolve against the decorated rows (Seam B) so synthetic WIP shas — injected in
 		// `getDecoratedRows` and absent from `graphState.rows` — still resolve to a row.
 		const row = this.rowBySha(sha);
@@ -2444,11 +2482,8 @@ export class GlGraphWrapper extends SignalWatcher(LitElement) {
 				}),
 			);
 		}
-		this._ipc.sendCommand(DoubleClickedCommand, {
-			type: 'row',
-			row: { id: sha, type: type },
-			preserveFocus: false,
-		});
+		// The host's row-double-click branch was a dead `Promise.resolve()` — the local event above
+		// is the whole handling, so there's no RPC round trip to make here.
 	}
 
 	private onGraphMoreRows(e: CustomEvent<{ displayRows: number } | null>) {
@@ -2509,8 +2544,32 @@ export class GlGraphWrapper extends SignalWatcher(LitElement) {
 				displayRows: displayRows,
 			});
 		}
+		void this.requestMoreRowsFromHost(undefined);
+	}
+
+	/**
+	 * Drives one page and holds `graphState.loading` for exactly its duration.
+	 *
+	 * The host resolves only after it has posted the rows emission its page produced, so clearing the
+	 * flag here is equivalent to the old "wait for a rows push" — except it also settles the cases that
+	 * push never covered (a page that added nothing, a superseded walk, a repo swap mid-flight).
+	 *
+	 * ACCEPTED EDGE: a visibility flip mid-page resolves the call with the emission still buffered, so
+	 * `loading` clears a moment before the rows appear. They land on the restore flush.
+	 */
+	private async requestMoreRowsFromHost(id: string | undefined, limit?: number): Promise<void> {
+		const services = this.services;
+		if (services == null) return;
+
 		this.graphState.loading = true;
-		this._ipc.sendCommand(GetMoreRowsCommand, { id: undefined });
+		try {
+			await (await services.rows).getMoreRows(id, limit);
+		} catch (ex) {
+			// A failed page leaves the current rows in place; the next scroll retries.
+			noop(ex);
+		} finally {
+			this.graphState.loading = false;
+		}
 	}
 
 	/** Re-run a page request deferred while a row load held the gate. Cheap enough for `updated()`: ONE plain
@@ -2620,20 +2679,47 @@ export class GlGraphWrapper extends SignalWatcher(LitElement) {
 		this.writeVscodeContext(serializeSelectionContext(context));
 	}
 
-	private onGraphMissingAvatars(event: CustomEvent<Record<string, string>>) {
-		// Host resolves the URLs and pushes them back through the `avatars` prop.
-		this._ipc.sendCommand(GetMissingAvatarsCommand, { emails: event.detail });
+	/** Rows scrolled into view carrying authors we have no avatar for. Straight request/response — the
+	 *  answer merges into the `avatars` prop; nothing rides a rows push. */
+	private onGraphMissingAvatars(event: CustomEvent<GraphAvatars>) {
+		const services = this.services;
+		if (services == null) return;
+
+		const emails = event.detail;
+		fireAndForget(
+			(async () => this.graphState.applyAvatars(await (await services.avatars).getMissingAvatars(emails)))(),
+			'avatars/getMissing',
+		);
 	}
 
-	private onGraphAvatarLoadError(event: CustomEvent<ProxyAvatarsParams>) {
-		// Host re-serves the broken remote avatar URLs through its proxy.
-		this._ipc.sendCommand(ProxyAvatarsCommand, event.detail);
+	/** The webview itself couldn't load these avatar URLs (CSP/CORS) — ask the host to re-serve them as
+	 *  data URIs. Only the entries that proxied come back, and they overwrite their own keys. */
+	private onGraphAvatarLoadError(event: CustomEvent<Record<string, string>>) {
+		const services = this.services;
+		if (services == null) return;
+
+		const avatars = event.detail;
+		fireAndForget(
+			(async () => this.graphState.applyAvatars(await (await services.avatars).proxyAvatars(avatars)))(),
+			'avatars/proxy',
+		);
 	}
 
+	/** The component asks for the ref-metadata types it's missing on visible rows. The response carries
+	 *  exactly those refs' resolved entries and spread-merges into the `refsMetadata` prop; an id the host
+	 *  couldn't resolve is omitted, which is what lets the component ask again. */
 	private onGraphMissingRefsMetadata(event: CustomEvent<GraphMissingRefsMetadata>) {
-		// The graph requests upstream (ahead/behind) metadata for tracked refs lazily; host resolves
-		// it and pushes it back through the `refsMetadata` prop.
-		this._ipc.sendCommand(GetMissingRefsMetadataCommand, { metadata: event.detail });
+		const services = this.services;
+		if (services == null) return;
+
+		const metadata = event.detail;
+		fireAndForget(
+			(async () =>
+				this.graphState.applyRefsMetadata(
+					await (await services.refsMetadata).getMissingRefsMetadata(metadata),
+				))(),
+			'refsMetadata/getMissing',
+		);
 	}
 
 	private onGraphVisibleDaysChanged(event: CustomEvent<{ top: number; bottom: number }>) {
@@ -2685,7 +2771,11 @@ export class GlGraphWrapper extends SignalWatcher(LitElement) {
 			...(refType === 'head' ? { isCurrentHead: current } : {}),
 			...(remote != null ? { owner: remote } : {}),
 		} satisfies Partial<GraphRef> as GraphRef;
-		this._ipc.sendCommand(DoubleClickedCommand, { type: 'ref', ref: ref, metadata: metadata });
+
+		const services = this.services;
+		if (services == null) return;
+
+		notifyService(services.rowActions, 'rowActions/refDoubleClick', svc => svc.handleRefDoubleClick(ref, metadata));
 	}
 
 	private onScopeAnchorsUnreachable(event: CustomEvent<Set<string>>) {
@@ -2803,13 +2893,11 @@ export class GlGraphWrapper extends SignalWatcher(LitElement) {
 				rowCount: rowCount,
 				attempts: (this._unreachableAnchorRequests.get(target)?.attempts ?? 0) + 1,
 			});
-			this.graphState.loading = true;
-			this._ipc.sendCommand(GetMoreRowsCommand, { id: target });
+			void this.requestMoreRowsFromHost(target);
 			return;
 		}
 
-		this.graphState.loading = true;
-		this._ipc.sendCommand(GetMoreRowsCommand, { id: undefined });
+		void this.requestMoreRowsFromHost(undefined);
 	}
 
 	private _lastSyncedWipShas: Set<string> | undefined;
@@ -2858,7 +2946,11 @@ export class GlGraphWrapper extends SignalWatcher(LitElement) {
 		}
 
 		this._lastSyncedWipShas = new Set(shas);
-		this._ipc.sendCommand(SyncWipWatchesCommand, { shas: shas });
+
+		const services = this.services;
+		if (services != null) {
+			notifyService(services.wip, 'wip/watches/sync', svc => svc.syncWatches(shas));
+		}
 
 		// Mirror the host's watcher set into graphState so `getWipState().isLive` reflects which
 		// repos are currently being watched. The state provider unions in the primary repo path
@@ -2904,11 +2996,14 @@ export class GlGraphWrapper extends SignalWatcher(LitElement) {
 		// selection-driven `force: true` fetch that is the only thing allowed to answer for them in that mode.
 		if (this.graphState.config?.showWorktreeWipStats === false) return;
 
+		const services = this.services;
+		if (services == null) return;
+
 		const ticket = this.graphState.claimWipStatsRequest(shas);
 		// A null response is the host answering nothing at all — same standing as a response missing every
 		// sha, so it must go through the miss/retry bookkeeping below rather than returning early. It's the
 		// failure most likely during startup/reconnect, and the visible-scan dedup never re-asks on its own.
-		const response = (await this._ipc.sendRequest(GetWipStatsRequest, { shas: shas })) ?? {};
+		const response = (await (await services.wip).getStats(shas)) ?? {};
 
 		// Merge fetched stats into the hot plane. Skipping no-op entries preserves the prior reference so
 		// downstream reactive consumers don't churn.

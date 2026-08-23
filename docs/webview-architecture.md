@@ -13,17 +13,17 @@ surface uses: an `RpcHost` (`src/webviews/webviewController.ts:225`) and the leg
 `notify()` / pending-notification queue (`src/webviews/webviewController.ts:976` onward). A
 surface's layer is determined by what its provider and app code call.
 
-| Surface         | Layer                       | Evidence                                                                                                               |
-| --------------- | --------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| Settings        | RPC only                    | `apps/settings/settings.ts:66`; `settings/protocol.ts` is 7 lines, 0 IPC types                                         |
-| Commit Details  | RPC only                    | `apps/commitDetails/commitDetails.ts:59`; `commitDetails/protocol.ts` has 0 IPC types                                  |
-| Home            | RPC, plus one legacy bridge | `apps/home/home.ts:103`; host still fires `DidChangeSubscription` for `PromosContext`                                  |
-| Timeline        | RPC, plus one legacy bridge | `apps/plus/timeline/timeline.ts:70`; bridge documented at `plus/timeline/timelineWebview.ts:116`                       |
-| Commit Graph    | **Hybrid**                  | RPC for auxiliary services and search; legacy IPC carries the rows data plane (82 IPC types, `plus/graph/protocol.ts`) |
-| Patch Details   | Legacy IPC                  | no `RpcController`; 30 IPC types                                                                                       |
-| Rebase          | Legacy IPC                  | no `RpcController`; 29 IPC types                                                                                       |
-| Welcome         | Legacy IPC                  | no `RpcController`; 6 IPC types                                                                                        |
-| Allowed Signers | Legacy IPC                  | no `RpcController`; 5 IPC types                                                                                        |
+| Surface         | Layer      | Evidence                                                                                                                                                                                                                                                                        |
+| --------------- | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Settings        | RPC only   | `apps/settings/settings.ts:66`; `settings/protocol.ts` is 7 lines, 0 IPC types                                                                                                                                                                                                  |
+| Commit Details  | RPC only   | `apps/commitDetails/commitDetails.ts:59`; `commitDetails/protocol.ts` has 0 IPC types                                                                                                                                                                                           |
+| Home            | RPC only   | `apps/home/home.ts:103`; the `PromosContext` bridge is gone — promos invalidate via `PromosContext.connect(subscription)`                                                                                                                                                       |
+| Timeline        | RPC only   | `apps/plus/timeline/timeline.ts:70`; its `PromosContext` bridge is gone too                                                                                                                                                                                                     |
+| Commit Graph    | RPC only   | RPC for everything, including the rows data plane — which rides a Supertalk `SequencedChannel` (`graph:rows`) on the same connection, so rows and the calls/events around them are FIFO-ordered (see `docs/graph-update-pipeline.md`). `plus/graph/protocol.ts` has 0 IPC types |
+| Patch Details   | Legacy IPC | no `RpcController`; 30 IPC types                                                                                                                                                                                                                                                |
+| Rebase          | Legacy IPC | no `RpcController`; 29 IPC types                                                                                                                                                                                                                                                |
+| Welcome         | Legacy IPC | no `RpcController`; 6 IPC types                                                                                                                                                                                                                                                 |
+| Allowed Signers | Legacy IPC | no `RpcController`; 5 IPC types                                                                                                                                                                                                                                                 |
 
 `src/webviews/protocol.ts` is **not** legacy-only — it defines the core-scope handshake every
 surface uses (`WebviewReadyRequest`, focus/visibility/configuration notifications,
@@ -32,15 +32,13 @@ surfaces alike.
 
 ### The Graph is hybrid, and the split matters
 
-The Graph has an `RpcController` (`apps/plus/graph/graph.ts:66`), and RPC covers the auxiliary
-services — `graphInspect`, `launchpad`, `walkthrough`, `sidebar`, `welcome`, `graphTimeline`,
-`graphTreemap` — plus the shared services and, since the search-plane migration, `search`
-(`GraphSearchService` in `plus/graph/graphService.ts`). Rows, selection, columns, refs, and WIP still travel over
-legacy IPC. The ledger-diffed splice channel in
-`docs/graph-update-pipeline.md` is an `IpcNotification`: published at
-`plus/graph/graphWebview.ts:882`, declared at `plus/graph/protocol.ts:1870`, consumed through
-`onMessageReceived` at `apps/plus/graph/stateProvider.ts:1679`. Do not assume Graph work happens
-over RPC.
+The Graph has an `RpcController` (`apps/plus/graph/graph.ts:66`) and is fully RPC: every service
+plane lives in `plus/graph/graphService.ts` (including the full-state push, branch state, and
+repo connection — `GraphStateService.onStateChanged` and the `repoStatus` events), and the rows
+plane (paging, splices, sync) rides a Supertalk `SequencedChannel` named `graph:rows` — see
+`docs/graph-update-pipeline.md`. `plus/graph/protocol.ts` is a pure types module with zero IPC
+declarations. The only legacy IPC a Graph webview still exchanges is the shared base webview
+protocol (`WebviewReadyRequest`, `ExecuteCommand`, the visibility/focus notifications).
 
 ### Cross-transport ordering has no guarantee
 

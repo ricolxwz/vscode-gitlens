@@ -14,7 +14,7 @@ import type { Remote } from '@eamodio/supertalk';
 import { Logger } from '@gitlens/utils/logger.js';
 import type { HomeServices } from '../../home/homeService.js';
 import type { OverviewFilters } from '../../home/protocol.js';
-import { noop } from '../shared/actions/rpc.js';
+import { isConnectionClosedError, noop } from '../shared/actions/rpc.js';
 import { sortAgentSessions } from '../shared/agentUtils.js';
 import type { LaunchpadService, LaunchpadState } from '../shared/contexts/launchpad.js';
 import type { HomeRootState } from './state.js';
@@ -23,6 +23,7 @@ import type { HomeRootState } from './state.js';
  * Resolved sub-service types (after awaiting the sub-service property from the Remote proxy).
  */
 type ResolvedHome = Awaited<Remote<HomeServices>['home']>;
+type ResolvedAgents = Awaited<Remote<HomeServices>['agents']>;
 /**
  * Callback for setting the inactive overview filter after it's fetched.
  * Keeps the overview state object ownership in the Lit component.
@@ -51,6 +52,11 @@ export async function restoreOverviewFilter(
 		await home.setOverviewFilter(persistedOverviewFilter);
 		applyOverviewFilter(await home.getOverviewFilterState());
 	} catch (ex) {
+		if (isConnectionClosedError(ex)) {
+			Logger.debug('Home: restore overview filter dropped by deliberate connection teardown');
+			return;
+		}
+
 		Logger.error(ex, 'Home: Failed to restore overview filter');
 	}
 }
@@ -72,6 +78,7 @@ export function populateInitialState(
 	integrations: Awaited<Remote<HomeServices>['integrations']>,
 	_repositories: Awaited<Remote<HomeServices>['repositories']>,
 	ai: Awaited<Remote<HomeServices>['ai']>,
+	agents: ResolvedAgents,
 	setOverviewFilter?: OverviewFilterSetter,
 ): Promise<void> {
 	// Layout-critical: set ready LAST since it's the render gate for main content.
@@ -96,7 +103,11 @@ export function populateInitialState(
 			state.home.ready.set(true); // render gate — set last
 		} else {
 			const ex = ctxResult.reason;
-			Logger.error(ex, 'Home: Failed to fetch initial context');
+			if (isConnectionClosedError(ex)) {
+				Logger.debug('Home: initial context fetch dropped by deliberate connection teardown');
+			} else {
+				Logger.error(ex, 'Home: Failed to fetch initial context');
+			}
 			state.home.error.set(ex instanceof Error ? ex.message : 'Failed to load');
 		}
 	});
@@ -112,7 +123,7 @@ export function populateInitialState(
 	// Secondary data: banners, filters, and content
 	// Note: repositories already set from getInitialContext() above; event-driven updates keep it fresh
 	void home.getWalkthroughProgress().then(w => state.onboarding.walkthroughProgress.set(w), noop);
-	void home.getAgentSessions().then(s => state.home.agentSessions.set(sortAgentSessions(s)), noop);
+	void agents.getSessions().then(s => state.home.agentSessions.set(sortAgentSessions(s)), noop);
 	void ai.getState().then(s => state.ai.state.set(s), noop);
 	// Launchpad summary is deferred — fetched when GlLaunchpad mounts (connectedCallback)
 
@@ -136,6 +147,11 @@ export async function restoreOverviewRepositoryPath(
 			state.overviewRepositoryPath.set(currentOverviewRepositoryPath);
 		}
 	} catch (ex) {
+		if (isConnectionClosedError(ex)) {
+			Logger.debug('Home: restore overview repository path dropped by deliberate connection teardown');
+			return;
+		}
+
 		Logger.error(ex, 'Home: Failed to restore overview repository path');
 	}
 }
@@ -153,7 +169,11 @@ export async function fetchLaunchpadSummary(
 		const summary = await launchpad.getSummary(options);
 		state.launchpadSummary.set(summary);
 	} catch (ex) {
-		Logger.error(ex, 'Home: Failed to fetch launchpad summary');
+		if (isConnectionClosedError(ex)) {
+			Logger.debug('Home: launchpad summary fetch dropped by deliberate connection teardown');
+		} else {
+			Logger.error(ex, 'Home: Failed to fetch launchpad summary');
+		}
 		const error = ex instanceof Error ? ex : new Error('Failed to load');
 		state.launchpadSummary.set({ error: { name: error.name, message: error.message } });
 	} finally {

@@ -30,12 +30,7 @@ import type {
 	GraphSidebarPullRequest,
 	State,
 } from '../../../../plus/graph/protocol.js';
-import {
-	GetWipLineStatsRequest,
-	getWipRowWorktreePath,
-	isWipSelectionSha,
-	UpdateWipDraftCommand,
-} from '../../../../plus/graph/protocol.js';
+import { getWipRowWorktreePath, isWipSelectionSha } from '../../../../plus/graph/protocol.js';
 import type { AiModelInfo, ConflictDetails } from '../../../../rpc/services/types.js';
 import type { FileChangeListItemDetail } from '../../../commitDetails/components/gl-details-base.js';
 import type {
@@ -43,6 +38,7 @@ import type {
 	CopyWipPatchEventDetail,
 	OpenMultipleChangesArgs,
 } from '../../../shared/actions/file.js';
+import { noopUnlessReal, notifyService } from '../../../shared/actions/rpc.js';
 import type { AgentSessionCategory, PastAgentSessionsResolver } from '../../../shared/agentUtils.js';
 import {
 	agentPhaseToCategory,
@@ -51,7 +47,6 @@ import {
 	matchAgentSessionsForWorktree,
 } from '../../../shared/agentUtils.js';
 import { renderDetailsMaximizeChip } from '../../../shared/components/details-header/details-maximize-chip.js';
-import { ipcContext } from '../../../shared/contexts/ipc.js';
 import type { WebviewContext } from '../../../shared/contexts/webview.js';
 import { webviewContext } from '../../../shared/contexts/webview.js';
 import { ContextMenuProxyController } from '../../../shared/controllers/context-menu-proxy.js';
@@ -231,9 +226,6 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 	@consume({ context: graphLaunchpadContext, subscribe: true })
 	private _launchpadState?: GraphLaunchpadState;
 
-	@consume({ context: ipcContext })
-	private _ipc?: typeof ipcContext.__context__;
-
 	@consume({ context: webviewContext })
 	private _webview!: WebviewContext;
 
@@ -398,7 +390,7 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 	private _agentStatusSplitPosition?: number;
 
 	/** Per-file working-tree line stats (keyed by normalized path) for the WIP file rows. Fetched
-	 *  lazily via {@link GetWipLineStatsRequest} — only while the WIP file list is shown — since the
+	 *  lazily via `services.wip.getLineStats` — only while the WIP file list is shown — since the
 	 *  every-tick `wip` push carries file status only, never line counts. */
 	@state()
 	private _wipFileStats?: GetWipLineStatsResponse;
@@ -693,6 +685,11 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 
 		if (this._wipFileStatsFetchedFor === wip) return;
 
+		// Bail before marking `wip` as fetched — a not-yet-connected remote must retry once
+		// `_remoteServices` (a `@state()`) resolves and re-triggers `updated()`.
+		const services = this._remoteServices;
+		if (services == null) return;
+
 		// On a repo/worktree switch, drop the prior repo's numbers immediately so we never show them
 		// against the new tree; same-repo working-tree ticks update in place (no row flicker).
 		if (this._wipFileStatsFetchedFor?.repo?.path !== repoPath) {
@@ -700,12 +697,19 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 		}
 		this._wipFileStatsFetchedFor = wip;
 
-		void this._ipc?.sendRequest(GetWipLineStatsRequest, { repoPath: repoPath }).then(stats => {
-			// Ignore a response a newer snapshot (or a view change) has already superseded.
-			if (this._wipFileStatsFetchedFor === wip) {
-				this._wipFileStats = stats ?? undefined;
+		void (async () => {
+			try {
+				const wipService = await services.wip;
+				const stats = await wipService.getLineStats(repoPath);
+				// Ignore a response a newer snapshot (or a view change) has already superseded.
+				if (this._wipFileStatsFetchedFor === wip) {
+					this._wipFileStats = stats ?? undefined;
+				}
+			} catch (ex) {
+				// Stats stay absent; the next working-tree tick refetches.
+				noopUnlessReal(ex);
 			}
-		});
+		})();
 	}
 
 	/** Lazily fetch the worktree's past (resumable) agent sessions while a WIP row is selected,
@@ -1354,7 +1358,11 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 	 *  host, the source of truth for cross-session restore. Pass `draft: null` to clear the slot. */
 	private persistWipDraft(worktreePath: string, draft: StoredGraphWipDraft | null): void {
 		this._graphState?.setWipDraft(worktreePath, draft);
-		this._ipc?.sendCommand(UpdateWipDraftCommand, { worktreePath: worktreePath, draft: draft });
+
+		const services = this._remoteServices;
+		if (services == null) return;
+
+		notifyService(services.wip, 'wip/updateDraft', svc => svc.updateDraft(worktreePath, draft));
 	}
 
 	/** Snapshot the commit-form signals and schedule a debounced flush to the host. Re-runs on

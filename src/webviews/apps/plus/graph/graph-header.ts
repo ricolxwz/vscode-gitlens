@@ -25,7 +25,8 @@ import type {
 	GraphWipState,
 	State,
 } from '../../../plus/graph/protocol.js';
-import { ChooseRepositoryCommand, createWipRowId, UpdateRefsVisibilityCommand } from '../../../plus/graph/protocol.js';
+import { createWipRowId } from '../../../plus/graph/protocol.js';
+import { notifyService } from '../../shared/actions/rpc.js';
 import type { GlPopover } from '../../shared/components/overlays/popover.js';
 import type { RepoButtonGroupClickEvent } from '../../shared/components/repo-button-group.js';
 import type { GlSearchBox } from '../../shared/components/search/search-box.js';
@@ -34,7 +35,8 @@ import type {
 	SearchNavigationEventDetail,
 } from '../../shared/components/search/search-input.js';
 import { inlineCode } from '../../shared/components/styles/lit/base.css.js';
-import { ipcContext } from '../../shared/contexts/ipc.js';
+import type { SubscriptionContextState } from '../../shared/contexts/subscription.js';
+import { subscriptionContext } from '../../shared/contexts/subscription.js';
 import type { TelemetryContext } from '../../shared/contexts/telemetry.js';
 import { telemetryContext } from '../../shared/contexts/telemetry.js';
 import type { WebviewContext } from '../../shared/contexts/webview.js';
@@ -45,7 +47,7 @@ import { emitTelemetrySentEvent } from '../../shared/telemetry.js';
 import { ruleStyles } from '../shared/components/vscode.css.js';
 import { getDisplayedMode, isGraphFiltered } from './components/gl-graph-scope-popover.js';
 import type { GlGraphScopePopover } from './components/gl-graph-scope-popover.js';
-import { graphStateContext } from './context.js';
+import { graphServicesContext, graphStateContext } from './context.js';
 import { getEffectiveDisplayMode } from './displayMode.js';
 import type { GraphNavigationOptions, GraphNavigationResult } from './graph-wrapper/graph-wrapper.js';
 import { compareGraphRefOpts, getHiddenRefLabel } from './hiddenRefs.utils.js';
@@ -169,14 +171,17 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 		`,
 	];
 
-	@consume({ context: ipcContext })
-	private _ipc!: typeof ipcContext.__context__;
-
 	@consume({ context: telemetryContext as { __context__: TelemetryContext } })
 	private _telemetry!: TelemetryContext;
 
+	@consume({ context: graphServicesContext, subscribe: true })
+	private _services?: typeof graphServicesContext.__context__;
+
 	@consume({ context: graphStateContext, subscribe: true })
 	private graphState!: typeof graphStateContext.__context__;
+
+	@consume({ context: subscriptionContext, subscribe: true })
+	private _subscription!: SubscriptionContextState;
 
 	@consume({ context: sidebarActionsContext, subscribe: true })
 	private _sidebarActions?: SidebarActions;
@@ -260,7 +265,7 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 	private _lastNavigationRepoPath: string | undefined;
 
 	override updated(changedProperties: PropertyValues): void {
-		this.aiAllowed = (this.graphState.config?.aiEnabled ?? true) && (this.graphState.orgSettings?.ai ?? true);
+		this.aiAllowed = (this.graphState.config?.aiEnabled ?? true) && this._subscription.orgSettings.get().ai;
 
 		const currentRepoPath = this.graphState.selectedRepository;
 		if (this._lastNavigationRepoPath !== currentRepoPath) {
@@ -727,7 +732,10 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 	}
 
 	private handleOnToggleRefsVisibilityClick(_event: any, refs: GraphExcludedRef[], visible: boolean) {
-		this._ipc.sendCommand(UpdateRefsVisibilityCommand, { refs: refs, visible: visible });
+		const services = this._services;
+		if (services == null) return;
+
+		notifyService(services.filters, 'filters/refs', svc => svc.setRefsVisibility(refs, visible));
 	}
 
 	private handleSearch() {
@@ -1038,9 +1046,13 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 	@debounce(250)
 	private onRepositorySelectorClicked(e: CustomEvent<RepoButtonGroupClickEvent>) {
 		switch (e.detail.part) {
-			case 'label':
-				this._ipc.sendCommand(ChooseRepositoryCommand);
+			case 'label': {
+				const services = this._services;
+				if (services == null) break;
+
+				notifyService(services.pickers, 'pickers/chooseRepository', svc => svc.chooseRepository());
 				break;
+			}
 
 			case 'icon':
 				emitTelemetrySentEvent<'graph/action/openRepoOnRemote'>(e.target!, {

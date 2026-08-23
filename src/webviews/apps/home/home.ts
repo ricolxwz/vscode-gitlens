@@ -1,6 +1,6 @@
 /*global*/
 import './home.scss';
-import type { Remote } from '@eamodio/supertalk';
+import type { Remote, Subscription } from '@eamodio/supertalk';
 import { ContextProvider } from '@lit/context';
 import { html, nothing } from 'lit';
 import { customElement, property, query, state } from 'lit/decorators.js';
@@ -112,6 +112,9 @@ export class GlHomeApp extends SignalWatcherWebviewApp {
 	/**
 	 * Context providers for state consumed by child components.
 	 */
+	/** True once the Lit context providers below exist — they're created once per element lifetime. */
+	private _contextProvidersCreated = false;
+
 	private _subscriptionCtx?: ContextProvider<typeof subscriptionContext>;
 	private _homeStateCtx?: ContextProvider<typeof homeStateContext>;
 	private _activeOverviewCtxProvider?: ContextProvider<typeof activeOverviewStateContext>;
@@ -246,9 +249,10 @@ export class GlHomeApp extends SignalWatcherWebviewApp {
 	}
 
 	/**
-	 * Unsubscribe function for RPC event subscriptions.
+	 * RPC event subscription — released at disconnect (before the actions its subscriber captured
+	 * are disposed) and recreated per ready against the new session's actions.
 	 */
-	private _unsubscribeEvents?: () => void;
+	private _eventsSubscription?: Subscription;
 
 	/**
 	 * Dynamic FS-level WIP watcher — re-subscribed when the overview repo changes.
@@ -278,11 +282,17 @@ export class GlHomeApp extends SignalWatcherWebviewApp {
 	override connectedCallback(): void {
 		super.connectedCallback?.();
 
-		const context = this.context;
+		const context = this.consumeOneShotAttribute(this.context);
 		this.context = undefined!;
 		this.initWebviewContext(context);
 
-		// Create context providers for child components
+		// Create context providers for child components — once per element lifetime: a provider
+		// attaches host listeners that nothing detaches, so re-creating them on a startup-churn
+		// remount would accumulate duplicate providers answering every context request. The
+		// backing state objects are element fields and survive the remount unchanged.
+		if (this._contextProvidersCreated) return;
+
+		this._contextProvidersCreated = true;
 		this._subscriptionCtx = new ContextProvider(this, {
 			context: subscriptionContext,
 			initialValue: createDefaultSubscriptionContextState(),
@@ -313,9 +323,12 @@ export class GlHomeApp extends SignalWatcherWebviewApp {
 		this._readyAbort?.abort(new DOMException('home: disconnected', 'AbortError'));
 		this._readyAbort = undefined;
 
-		// Unsubscribe RPC event callbacks (before RPC connection is disposed)
-		this._unsubscribeEvents?.();
-		this._unsubscribeEvents = undefined;
+		// Unsubscribe BEFORE the actions/state below are disposed: the retained handle would
+		// otherwise re-issue its subscriber — which closes over those disposed objects — on the
+		// next handshake, ahead of `_onRpcReady`'s replacement. A fresh subscription is created
+		// per ready anyway, so nothing is lost by releasing this one here.
+		this._eventsSubscription?.unsubscribe();
+		this._eventsSubscription = undefined;
 		this._wipWatchUnsubscribe?.();
 		this._wipWatchUnsubscribe = undefined;
 
@@ -344,7 +357,7 @@ export class GlHomeApp extends SignalWatcherWebviewApp {
 		this._commandsState.service = undefined;
 
 		// GlWebviewApp: cleans up focus tracker, disposes ipc/promos/telemetry/DOM listeners
-		// Lit framework: calls RpcController.hostDisconnected() → disposes RPC connection
+		// Lit framework: calls RpcController.hostDisconnected() → ends the RPC session (the connection lives on)
 		super.disconnectedCallback?.();
 	}
 
@@ -416,7 +429,6 @@ export class GlHomeApp extends SignalWatcherWebviewApp {
 		const [
 			home,
 			launchpad,
-			config,
 			subscription,
 			integrations,
 			repositories,
@@ -425,10 +437,10 @@ export class GlHomeApp extends SignalWatcherWebviewApp {
 			commands,
 			onboarding,
 			branches,
+			agents,
 		] = await Promise.all([
 			services.home,
 			services.launchpad,
-			services.config,
 			services.subscription,
 			services.integrations,
 			services.repositories,
@@ -437,7 +449,11 @@ export class GlHomeApp extends SignalWatcherWebviewApp {
 			services.commands,
 			services.onboarding,
 			services.branches,
+			services.agents,
 		]);
+
+		// Subscription changes invalidate the promo cache.
+		this._promos.connect(this._rpc.connection!);
 
 		// Supertalk remote proxy properties are thenable at runtime (ProxyProperty with .then()),
 		// but Remote<T> types them as synchronous values. The lint rule correctly detects the
@@ -699,24 +715,11 @@ export class GlHomeApp extends SignalWatcherWebviewApp {
 				void this._fetchAgentCoalesced();
 			},
 		};
-		this._unsubscribeEvents = await phaseTimeout(
-			'setupSubscriptions',
-			30_000,
-			setupSubscriptions(
-				root,
-				{
-					home: home,
-					launchpad: launchpad,
-					config: config,
-					subscription: subscription,
-					integrations: integrations,
-					repositories: repositories,
-					onboarding: onboarding,
-					ai: ai,
-				},
-				actions,
-			),
-		);
+		// Recreated per ready (not `??=`): the subscriber closes over this session's state/actions —
+		// see the equivalent note in commitDetails.ts.
+		this._eventsSubscription?.unsubscribe();
+		this._eventsSubscription = setupSubscriptions(this._rpc.connection!, root, actions);
+		await phaseTimeout('setupSubscriptions', 30_000, this._eventsSubscription.ready);
 
 		// Start FS-level WIP watcher for the initial overview repo
 		watchWipForRepo(this._homeState.overviewRepositoryPath.get());
@@ -752,7 +755,16 @@ export class GlHomeApp extends SignalWatcherWebviewApp {
 		await phaseTimeout(
 			'populateInitialState',
 			30_000,
-			populateInitialState(root, home, subscription, integrations, repositories, ai, syncInactiveOverviewFilter),
+			populateInitialState(
+				root,
+				home,
+				subscription,
+				integrations,
+				repositories,
+				ai,
+				agents,
+				syncInactiveOverviewFilter,
+			),
 		);
 	}
 

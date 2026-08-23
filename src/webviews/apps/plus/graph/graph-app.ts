@@ -22,15 +22,17 @@ import { areEqual } from '@gitlens/utils/object.js';
 import { basename } from '@gitlens/utils/path.js';
 import type { GraphBranchesVisibility } from '../../../../config.js';
 import type { GlExtensionCommands } from '../../../../constants.commands.js';
-import type { GraphDetailsMode } from '../../../../constants.telemetry.js';
+import type { GraphDetailsMode, TrackedUsageKeys } from '../../../../constants.telemetry.js';
 import { mergeWebviewItems } from '../../../../system/webview.js';
 import type { CommitDetails } from '../../../commitDetails/protocol.js';
 import type {
+	DidGetRowHoverParams,
 	DidGetSidebarDataParams,
 	DidRequestOpenCompareModeParams,
 	DidRequestOpenTimelineScopeParams,
 	DidRequestSearchParams,
 	GraphCoachMarkType,
+	GraphComponentConfig,
 	GraphComposeScopeSeed,
 	GraphDisplayMode,
 	GraphItemContext,
@@ -47,29 +49,12 @@ import type {
 } from '../../../plus/graph/protocol.js';
 import {
 	createWipRowId,
-	EnableChangesColumnCommand,
-	GetRowHoverRequest,
 	getWipRowWorktreePath,
-	GetWipStatsRequest,
 	isPrimaryWipRowId,
 	isWipSelectionSha,
-	MergePullRequestRequest,
-	ResetGraphFiltersCommand,
-	TrackGraphDetailsCompareModeCommand,
-	TrackGraphDetailsComposeModeCommand,
-	TrackGraphDetailsResolveModeCommand,
-	TrackGraphDetailsReviewModeCommand,
-	TrackGraphDetailsWipShownCommand,
-	TrackGraphScopeChangedCommand,
-	UpdateColumnModeCommand,
-	UpdateExcludeTypesCommand,
-	UpdateGraphConfigurationCommand,
-	UpdateGraphDisplayModeCommand,
-	UpdateIncludedRefsCommand,
-	UpdateRefsVisibilityCommand,
 } from '../../../plus/graph/protocol.js';
 import { ExecuteCommand } from '../../../protocol.js';
-import { fireAndForget, noop } from '../../shared/actions/rpc.js';
+import { fireAndForget, noop, notifyService } from '../../shared/actions/rpc.js';
 import { indexAgentSessionsByRepoAndWorktree, matchAgentSessionsForWorktree } from '../../shared/agentUtils.js';
 import type { CustomEventType } from '../../shared/components/element.js';
 import type { GlDragShiftOverlay } from '../../shared/components/overlays/drag-shift-overlay.js';
@@ -341,6 +326,8 @@ type DetailsVisibleTrigger =
 @customElement('gl-graph-app')
 export class GraphApp extends SignalWatcher(LitElement) {
 	private _hoverTrackingCounter = getScopedCounter();
+	/** Aborts a superseded hover fetch — a newer row's hover always supersedes an outstanding one. */
+	private _hoverAbort?: AbortController;
 	private _selectionTrackingCounter = getScopedCounter();
 	private _lastSearchRequest: SearchQuery | undefined;
 	private _wasDetailsVisible = false;
@@ -522,7 +509,12 @@ export class GraphApp extends SignalWatcher(LitElement) {
 			this.coachMarksAllowed &&
 			// The banner auto-opens for the same audience and `closeOthers()` can't reach it, so a tip
 			// would land on top. One session only: nothing expires the banner on its own.
-			(deferredBefore === true || !isGraphWalkthroughBannerHighlighted(this.graphState))
+			(deferredBefore === true ||
+				!isGraphWalkthroughBannerHighlighted({
+					bannerCollapsed: this._dismissals?.get('graph-walkthrough:banner'),
+					graphWalkthroughProgress: this._onboardingState.graphWalkthroughProgress.get(),
+					graphWalkthroughStarted: this.graphState.graphWalkthroughStarted,
+				}))
 		);
 	}
 
@@ -652,6 +644,14 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		return gs.repositories?.find(r => r.id === gs.selectedRepository)?.virtual ?? false;
 	}
 
+	/** Whether the one-time layout-choice prompt should show. Bootstrap seeds the initial value (no
+	 *  async fetch on first render — flash risk); a live dismissal of `graph:layoutPrompt` (e.g. from
+	 *  another window) flips it false via the onboarding dismissals cache, which only ever transitions
+	 *  true → false, never back. */
+	private get layoutPromptNeeded(): boolean {
+		return (this.graphState.layoutPromptNeeded ?? false) && this._dismissals?.get('graph:layoutPrompt') !== true;
+	}
+
 	// use Light DOM
 	protected override createRenderRoot(): HTMLElement | DocumentFragment {
 		return this;
@@ -676,6 +676,37 @@ export class GraphApp extends SignalWatcher(LitElement) {
 
 	@consume({ context: graphServicesContext, subscribe: true })
 	private services?: typeof graphServicesContext.__context__;
+
+	/** Fire-and-forget usage tracking (drives walkthrough state + `usage/track` telemetry). */
+	private trackUsage(key: TrackedUsageKeys): void {
+		const services = this.services;
+		if (services == null) return;
+
+		notifyService(services.telemetry, 'track usage', svc => svc.trackUsage(key));
+	}
+
+	/** Persists a graph config change via RPC, resolving once the write lands (the new config
+	 *  itself arrives separately over `configuration.onDidChange`, wired in `stateProvider.ts`). */
+	private updateGraphConfig(changes: Partial<GraphComponentConfig>): Promise<void> {
+		const services = this.services;
+		if (services == null) return Promise.resolve();
+
+		return (async () => (await services.configuration).update(changes))();
+	}
+
+	/** Resolves the filters RPC sub-service, or `undefined` before the handshake completes. Its writes
+	 *  resolve once the host has written and fired; the resulting STATE arrives one transport hop later on
+	 *  the filters push — see {@link waitForState}. */
+	private async getFiltersService(): Promise<Awaited<NonNullable<typeof this.services>['filters']> | undefined> {
+		return this.services?.filters;
+	}
+
+	private setDisplayMode(mode: GraphDisplayMode): Promise<void> {
+		const services = this.services;
+		if (services == null) return Promise.resolve();
+
+		return (async () => (await services.configuration).setDisplayMode(mode))();
+	}
 
 	// Cross-pane shared signals: state owned by one pane (e.g. the details panel's
 	// running-modes registry) but observed by another (e.g. row adornments in the graph
@@ -1737,7 +1768,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 	 *  `params.selectSha` is intentionally NOT forwarded to the header: the host-side
 	 *  `hasSearchQuery` handler already calls `setSelectedRows` and (when needed) `onGetMoreRows`
 	 *  synchronously before firing this notification. The selection update reaches the webview via
-	 *  the separate `DidChangeSelectionNotification` push, not via the search query.
+	 *  the separate `GraphSelectionService.onSelectionChanged` push, not via the search query.
 	 *
 	 *  Sets `_lastSearchRequest` so the cold-show path's `state.searchRequest` consumer (in
 	 *  `updated()`) treats this request as already handled if the same query also lands in state. */
@@ -2166,13 +2197,18 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		// Drop the active scope when the clicked WIP isn't part of it, so the worktree's row
 		// materializes in the now-unscoped graph and `navigateToCommit` below can reveal it.
 		// Leave the scope untouched when the pill already matches it. Uses the canonical clear
-		// (`deferScopeClear` + `ResetGraphFilters`): the host's filter-reset reloads unscoped rows and
-		// fires the deferred clear in the same pass. (Pills hidden purely by `branchesVisibility` are
-		// out of this rule's scope — the product decision is scope-only.)
+		// (`deferScopeClear` + the filters reset): the host's filter-reset reloads unscoped rows and pushes
+		// the snapshot that fires the deferred clear. (Pills hidden purely by `branchesVisibility` are out
+		// of this rule's scope — the product decision is scope-only.)
 		const scopeCleared = gs.scope != null && !this.isWipPillInScope(id, gs.scope);
+		let resetFilters: Promise<void> | undefined;
 		if (scopeCleared) {
 			gs.deferScopeClear();
-			this._ipc.sendCommand(ResetGraphFiltersCommand, undefined);
+			// Attach a rejection sink at creation — a failed reset already leaves the deferred scope
+			// clear untouched (it's consumed on the host's push; no push means the `waitForState`
+			// timeout below covers it), so there's nothing more to do here than keep it from surfacing
+			// as an unhandled rejection.
+			resetFilters = (async () => (await this.getFiltersService())?.reset())().catch(noop);
 		}
 		// Anchor the selection synchronously, normalized to `uncommitted` — every WIP row (primary
 		// and secondary alike) collapses to that sha and is distinguished by `repoPath`, matching
@@ -2191,13 +2227,17 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		// Graph may be freshly mounted by the display-mode switch above — wait one update cycle so
 		// `this.graph` exists before navigating (what the `openWipDetails` await used to cover).
 		await this.updateComplete;
-		// When we cleared the scope above, the unscoped rows arrive via a host round-trip
-		// (`ResetGraphFilters` → `DidChangeRefsVisibilityNotification`), which can take longer than
-		// `navigateToCommit`'s deferred render path. Wait for the scope to actually clear first
-		// so that retry window starts against the settled (unscoped) state instead of expiring before
-		// the worktree's row materializes.
-		if (scopeCleared) {
-			await this.waitForScopeCleared();
+		// When we cleared the scope above, the unscoped rows arrive via a host round-trip. The reset
+		// resolves once the host wrote and fired; the cleared scope itself lands one hop later, on the
+		// filters push that consumes the deferred clear — so wait for the settled state too, or the
+		// retry window starts before the worktree's row can materialize. Both halves of the predicate
+		// matter: the state clears synchronously, but the graph's projection lifts on its next update —
+		// a jump re-run in between classifies its target against the STALE projection.
+		if (resetFilters != null) {
+			await resetFilters;
+			await this.waitForState(
+				() => this.graphState.scope == null && this.graph?.isScopeProjectionActive() !== true,
+			);
 		}
 		// Select + reveal the WIP row in the graph itself — the bar's stated intent, and the user's
 		// immediate feedback — BEFORE opening the details panel. The `id` is `uncommitted` for the
@@ -2221,21 +2261,17 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		}
 	}
 
-	/** Resolves once the active scope has cleared (or a safety timeout elapses). Used after a
-	 *  scope-clearing overview-bar click: the clear lands via a host round-trip, so this lets the
-	 *  subsequent `navigateToCommit` run against the settled unscoped state rather than racing
-	 *  the reload. Polls with `setTimeout` (not RAF) so it still resolves if the webview is hidden. */
-	private waitForScopeCleared(timeoutMs = 2000): Promise<void> {
-		// Both halves matter: the state clears synchronously, but the graph's projection lifts on
-		// its next update — a jump re-run in between classifies its target against the STALE
-		// projection and reports "outside the current scope" for a scope that no longer exists.
-		const cleared = (): boolean => this.graphState.scope == null && this.graph?.isScopeProjectionActive() !== true;
-		if (cleared()) return Promise.resolve();
+	/** Resolves once `predicate` holds (or a safety timeout elapses). An RPC write resolves when the HOST
+	 *  has written and fired — the resulting state push arrives a transport hop later, so a caller that must
+	 *  re-read settled state after its own write still has to wait for it. Polls with `setTimeout` (not RAF)
+	 *  so it still resolves while the webview is hidden. */
+	private waitForState(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
+		if (predicate()) return Promise.resolve();
 
 		return new Promise<void>(resolve => {
 			const start = Date.now();
 			const check = (): void => {
-				if (cleared() || Date.now() - start >= timeoutMs) {
+				if (predicate() || Date.now() - start >= timeoutMs) {
 					resolve();
 					return;
 				}
@@ -2248,7 +2284,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 
 	/** Waits for the scope's projection to actually apply to the rendered rows (or `timeoutMs`, for
 	 *  scopes that resolve dim-only and never project) — positioning before the restructure lands
-	 *  scrolls the old layout and then yanks to the new one. Poll cadence matches waitForScopeCleared. */
+	 *  scrolls the old layout and then yanks to the new one. Poll cadence matches waitForState. */
 	private waitForScopeProjection(timeoutMs = 800): Promise<void> {
 		const applied = (): boolean => this.graph?.isScopeProjectionActive() === true;
 		if (applied()) return Promise.resolve();
@@ -2371,7 +2407,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		// reference — which churns that hover's settle timer every unrelated tick. `areEqual` is a deep
 		// compare, so it covers the nested `wip` and `row marker` payloads too. Content-compared, not
 		// identity-compared: nothing in an OverviewBarItem is derived from the clock, so equal content
-		// really means "nothing changed" (an earlier cut carried a sub-minute `lastActivity` string that
+		// really means "nothing changed" (an earlier cut carried a sub-minute `lastActivity` number that
 		// would have defeated this on every tick while an agent worked — precisely when the bar is
 		// busiest; the row-marker legs are shas + counts, so they hold that property).
 		const prevById = new Map(prev.map(item => [item.id, item]));
@@ -2651,7 +2687,15 @@ export class GraphApp extends SignalWatcher(LitElement) {
 			this._bannerDeferredBefore ??= deferral;
 			// Only when the banner is what's actually holding marks back: the header doesn't render
 			// without a repo, so there may be no banner to defer to.
-			if (!deferral && this.coachMarksAllowed && isGraphWalkthroughBannerHighlighted(this.graphState)) {
+			if (
+				!deferral &&
+				this.coachMarksAllowed &&
+				isGraphWalkthroughBannerHighlighted({
+					bannerCollapsed: this._dismissals?.get('graph-walkthrough:banner'),
+					graphWalkthroughProgress: this._onboardingState.graphWalkthroughProgress.get(),
+					graphWalkthroughStarted: this.graphState.graphWalkthroughStarted,
+				})
+			) {
 				this._dismissals?.dismiss('graph:coachMarks:bannerDeferral');
 			}
 		}
@@ -2675,7 +2719,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 			this._introShownReported = true;
 			emitTelemetrySentEvent<'graph/intro/shown'>(this, {
 				name: 'graph/intro/shown',
-				data: { withLayoutOptions: this.graphState.layoutPromptNeeded ?? false },
+				data: { withLayoutOptions: this.layoutPromptNeeded },
 			});
 		}
 
@@ -2736,7 +2780,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 				// (hidden details) experience. Single chokepoint for every show path, including
 				// host-driven (pending action) shows.
 				if (this.graphState.config?.detailsLocation == null) {
-					this._ipc.sendCommand(UpdateGraphConfigurationCommand, { changes: { detailsLocation: 'auto' } });
+					fireAndForget(this.updateGraphConfig({ detailsLocation: 'auto' }), 'configuration/update');
 				}
 				const pane = this.querySelector<HTMLElement>('.graph__details-pane');
 				if (pane) {
@@ -2794,7 +2838,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 			this._wasDisplayMode = displayMode;
 			// Notify the host so it can fetch row stats when entering Visualizations mode (stats are
 			// otherwise only loaded when the minimap or changes column is visible).
-			this._ipc.sendCommand(UpdateGraphDisplayModeCommand, { mode: displayMode });
+			fireAndForget(this.setDisplayMode(displayMode), 'configuration/setDisplayMode');
 		}
 
 		// First-render auto-restore telemetry: panel was visible from persisted state, no explicit
@@ -2847,7 +2891,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		}
 
 		// Handle a cold-show compare request (e.g. a terminal-link range) — warm shows arrive via
-		// DidRequestOpenCompareModeNotification instead. Mirrors the pendingAction handling above.
+		// `GraphNavigationService.onRequestOpenCompareMode` instead. Mirrors the pendingAction handling above.
 		const pendingCompare = this.graphState.pendingCompare;
 		if (pendingCompare != null) {
 			this.graphState.pendingCompare = undefined;
@@ -2904,7 +2948,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 				.intentAction=${this._gatedPendingAction?.action}
 				.welcome=${this.shouldShowWelcome}
 				.liveSignIn=${this._postSignInPending}
-				.showLayoutOptions=${this.graphState.layoutPromptNeeded ?? false}
+				.showLayoutOptions=${this.layoutPromptNeeded}
 				.upgradedFromPreV19=${this.graphState.upgradedFromPreV19 ?? false}
 				@gl-continue=${this.onWelcomeContinue}
 			></gl-graph-access-account>`;
@@ -3084,7 +3128,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 			return;
 		}
 
-		this._ipc.sendCommand(TrackGraphDetailsWipShownCommand, undefined);
+		this.trackUsage('action:gitlens.graph.details.wipShown:happened');
 	}
 
 	private renderGraphPaneContent() {
@@ -3429,40 +3473,35 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		></gl-graph-jump-toast>`;
 	}
 
-	/** Polls `predicate` (32ms tick, matching {@link waitForScopeCleared}) so a remedy that round-trips
-	 *  through the host has a settled state to re-navigate against instead of racing the push. Resolves
-	 *  either way once `timeoutMs` elapses — the retry navigation still runs; it just might not land yet. */
-	private waitForJumpRemedy(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
-		if (predicate()) return Promise.resolve();
-
-		return new Promise<void>(resolve => {
-			const start = Date.now();
-			const check = (): void => {
-				if (predicate() || Date.now() - start >= timeoutMs) {
-					resolve();
-					return;
-				}
-
-				setTimeout(check, 32);
-			};
-			setTimeout(check, 32);
-		});
-	}
-
-	/** Applies a remedy, waits for its effect to settle (or times out), then re-runs the jump with the
-	 *  landing flash — the same sequence the WIP bar's scope-clear jump already relies on (see
-	 *  {@link selectOverviewBarItem}). */
+	/**
+	 * Applies a remedy, waits for its effect to reach the app's own state (or times out), then re-runs the
+	 * jump with the landing flash — the same sequence the WIP bar's scope-clear jump relies on (see
+	 * {@link selectOverviewBarItem}).
+	 *
+	 * `settled` is not redundant with awaiting `apply`: a write resolves once the host wrote and fired, but
+	 * the re-navigation reads `graphState`, which only catches up when the resulting push lands.
+	 */
 	private applyJumpRemedy(
 		sha: string,
 		ref: string | undefined,
 		source: GraphNavigationSource | undefined,
-		apply: () => void,
-		wait: () => Promise<void>,
+		apply: () => void | Promise<void>,
+		settled: () => boolean,
 	): void {
-		this.clearJumpToast();
 		void (async () => {
-			apply();
-			await wait();
+			try {
+				await apply();
+			} catch (ex) {
+				// A failed remedy leaves the toast up — no state changed, so there's nothing to wait
+				// for or re-navigate against, and the user keeps the retry action instead of losing
+				// the recovery UI to a silent failure.
+				noop(ex);
+				return;
+			}
+			// Dismiss only once the remedy write actually landed — clearing up front would leave the
+			// user with neither feedback nor the action on a failed write.
+			this.clearJumpToast();
+			await this.waitForState(settled);
 			void this.graph?.navigateToCommit(sha, { source: source ?? 'jump', flash: true, ref: ref });
 		})();
 	}
@@ -3492,11 +3531,8 @@ export class GraphApp extends SignalWatcher(LitElement) {
 							sha,
 							ref,
 							source,
-							() =>
-								this._ipc.sendCommand(UpdateGraphConfigurationCommand, {
-									changes: { onlyFollowFirstParent: false },
-								}),
-							() => this.waitForJumpRemedy(() => this.graphState.config?.onlyFollowFirstParent !== true),
+							() => this.updateGraphConfig({ onlyFollowFirstParent: false }),
+							() => this.graphState.config?.onlyFollowFirstParent !== true,
 						),
 				};
 			case 'not-found':
@@ -3541,12 +3577,10 @@ export class GraphApp extends SignalWatcher(LitElement) {
 								sha,
 								ref,
 								source,
-								() =>
-									this._ipc.sendCommand(UpdateRefsVisibilityCommand, {
-										refs: [entry],
-										visible: true,
-									}),
-								() => this.waitForJumpRemedy(() => !(entry.id in (this.graphState.excludeRefs ?? {}))),
+								async () => {
+									await (await this.getFiltersService())?.setRefsVisibility([entry], true);
+								},
+								() => !(entry.id in (this.graphState.excludeRefs ?? {})),
 							),
 					};
 				}
@@ -3565,12 +3599,10 @@ export class GraphApp extends SignalWatcher(LitElement) {
 								sha,
 								ref,
 								source,
-								() =>
-									this._ipc.sendCommand(UpdateExcludeTypesCommand, {
-										key: 'stashes',
-										value: false,
-									}),
-								() => this.waitForJumpRemedy(() => this.graphState.excludeTypes?.stashes !== true),
+								async () => {
+									await (await this.getFiltersService())?.setExcludeType('stashes', false);
+								},
+								() => this.graphState.excludeTypes?.stashes !== true,
 							),
 					};
 				}
@@ -3591,12 +3623,10 @@ export class GraphApp extends SignalWatcher(LitElement) {
 							sha,
 							ref,
 							source,
-							() =>
-								this._ipc.sendCommand(UpdateIncludedRefsCommand, {
-									branchesVisibility: 'all',
-									refs: undefined,
-								}),
-							() => this.waitForJumpRemedy(() => this.graphState.branchesVisibility === 'all'),
+							async () => {
+								await (await this.getFiltersService())?.setIncludedRefs('all', undefined);
+							},
+							() => this.graphState.branchesVisibility === 'all',
 						),
 				};
 			}
@@ -3612,7 +3642,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 							ref,
 							source,
 							() => this.graphState.clearScope(),
-							() => this.waitForScopeCleared(),
+							() => this.graphState.scope == null,
 						),
 				};
 			case 'search-filter':
@@ -3636,7 +3666,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 										},
 									}),
 								),
-							() => this.waitForJumpRemedy(() => this.graphState.searchMode !== 'filter'),
+							() => this.graphState.searchMode !== 'filter',
 						),
 				};
 			case 'collapsed':
@@ -3674,8 +3704,10 @@ export class GraphApp extends SignalWatcher(LitElement) {
 					sha,
 					ref,
 					source,
-					() => this._ipc.sendCommand(UpdateRefsVisibilityCommand, { refs: refs, visible: true }),
-					() => this.waitForJumpRemedy(() => Object.keys(this.graphState.excludeRefs ?? {}).length === 0),
+					async () => {
+						await (await this.getFiltersService())?.setRefsVisibility(refs, true);
+					},
+					() => Object.keys(this.graphState.excludeRefs ?? {}).length === 0,
 				),
 		};
 	}
@@ -3886,8 +3918,10 @@ export class GraphApp extends SignalWatcher(LitElement) {
 			confirmed?: boolean;
 		}>,
 	): Promise<void> => {
-		const response = await this._ipc.sendRequest(MergePullRequestRequest, {
-			number: e.detail.number,
+		const pullRequest = await this.services?.pullRequest;
+		if (pullRequest == null) return;
+
+		const response = await pullRequest.merge(e.detail.number, {
 			mergeMethod: e.detail.mergeMethod,
 			confirmed: e.detail.confirmed,
 		});
@@ -4391,7 +4425,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 			this.graphState.details = { maximized: false };
 		}
 
-		this._ipc.sendCommand(UpdateGraphConfigurationCommand, { changes: { detailsLocation: location } });
+		fireAndForget(this.updateGraphConfig({ detailsLocation: location }), 'configuration/update');
 
 		if (!this.graphState.details?.visible) {
 			this.setDetailsVisible(true, 'placement');
@@ -4471,7 +4505,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 				isWipSelectionSha(selectedSha) || (single == null && multi == null && this.fallbackRepoPath != null);
 			if (effectivelyUncommitted && this._nextStepsShownWhileHidden) {
 				this._nextStepsShownWhileHidden = false;
-				this._ipc.sendCommand(TrackGraphDetailsWipShownCommand, undefined);
+				this.trackUsage('action:gitlens.graph.details.wipShown:happened');
 			}
 			const host = this.graphState.webviewId === 'gitlens.graph' ? 'editor' : 'view';
 			const location = this.effectiveDetailsLocation;
@@ -4529,16 +4563,16 @@ export class GraphApp extends SignalWatcher(LitElement) {
 
 		switch (e.detail.current) {
 			case 'review':
-				this._ipc.sendCommand(TrackGraphDetailsReviewModeCommand, undefined);
+				this.trackUsage('action:gitlens.graph.details.reviewMode:happened');
 				break;
 			case 'compose':
-				this._ipc.sendCommand(TrackGraphDetailsComposeModeCommand, undefined);
+				this.trackUsage('action:gitlens.graph.details.composeMode:happened');
 				break;
 			case 'resolve':
-				this._ipc.sendCommand(TrackGraphDetailsResolveModeCommand, undefined);
+				this.trackUsage('action:gitlens.graph.details.resolveMode:happened');
 				break;
 			case 'compare':
-				this._ipc.sendCommand(TrackGraphDetailsCompareModeCommand, undefined);
+				this.trackUsage('action:gitlens.graph.details.compareMode:happened');
 				break;
 		}
 
@@ -4702,7 +4736,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 
 		const choice = e.detail?.layoutChoice ?? 'dismissed';
 		// Preserve layout analytics: fire only when the layout section was actually shown.
-		if (this.graphState.layoutPromptNeeded ?? false) {
+		if (this.layoutPromptNeeded) {
 			emitTelemetrySentEvent<'graph/layoutPrompt/choice'>(this, {
 				name: 'graph/layoutPrompt/choice',
 				data: { choice: choice },
@@ -4714,9 +4748,8 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		// dismissal write and the view move ride the same causally-ordered RPC message (see
 		// docs/webview-architecture.md).
 		if (this.services != null) {
-			fireAndForget(
-				(async () => (await this.services!.welcome).continueToGraph({ layoutChoice: choice }))(),
-				'welcome/continueToGraph',
+			notifyService(this.services.welcome, 'welcome/continueToGraph', svc =>
+				svc.continueToGraph({ layoutChoice: choice }),
 			);
 		}
 	}
@@ -4761,7 +4794,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 
 	private handleSidebarTogglePinned = (): void => {
 		const next = !(this.graphState.config?.sidebarPinned ?? false);
-		this._ipc.sendCommand(UpdateGraphConfigurationCommand, { changes: { sidebarPinned: next } });
+		fireAndForget(this.updateGraphConfig({ sidebarPinned: next }), 'configuration/update');
 	};
 
 	private handleDisplayModeChange = (e: CustomEvent<GraphSidebarDisplayModeChangeEventDetail>): void => {
@@ -4954,7 +4987,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		const gs = this.graphState;
 		if (gs.overviewRecentThreshold === e.detail.threshold) return;
 
-		// The overview panel sends the `GetOverviewRequest` itself — graph-app only owns the
+		// The overview panel sends the `getOverview` RPC call itself — graph-app only owns the
 		// persisted signal + `graph:state` memento write (mirrors `handleTimelineConfigChange`).
 		gs.overviewRecentThreshold = e.detail.threshold;
 		this.persistState();
@@ -4968,7 +5001,10 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		// the host round-trip to settle, then re-reveal the branch so the user keeps their place.
 		if (this.graphState.scope?.branchRef === e.detail.branchId) {
 			this.graphState.clearScope();
-			await this.waitForScopeCleared();
+			// Same settled-state predicate as the overview bar's scope-clearing click.
+			await this.waitForState(
+				() => this.graphState.scope == null && this.graph?.isScopeProjectionActive() !== true,
+			);
 
 			const sha = this.getOverviewBranchSelectionSha(e.detail.branchId);
 			if (sha != null) {
@@ -5187,7 +5223,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 			currentBranch: this.graphState.branch,
 		});
 		if (sha != null && sha !== '') {
-			// If the helper returned the tip and tip isn't loaded, the IPC `LoadRowRequest`
+			// If the helper returned the tip and tip isn't loaded, the `rows.loadRow`
 			// fallback in `navigateToCommit` will fetch it; otherwise the fast path or
 			// synthetic-WIP retry handles it.
 			this.revealForScope(sha, branchName, branchRef, 'overview');
@@ -5279,7 +5315,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 			return;
 		}
 
-		this._ipc.sendCommand(TrackGraphScopeChangedCommand, undefined);
+		this.trackUsage('action:gitlens.graph.scope.changed:happened');
 		emitTelemetrySentEvent<'graph/scope/changed'>(this, {
 			name: 'graph/scope/changed',
 			data: {
@@ -5450,16 +5486,12 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		const { minimapDataType, minimapReversed, markerType, checked } = e.detail;
 
 		if (minimapDataType != null) {
-			this._ipc.sendCommand(UpdateGraphConfigurationCommand, {
-				changes: { minimapDataType: minimapDataType },
-			});
+			fireAndForget(this.updateGraphConfig({ minimapDataType: minimapDataType }), 'configuration/update');
 			return;
 		}
 
 		if (minimapReversed != null) {
-			this._ipc.sendCommand(UpdateGraphConfigurationCommand, {
-				changes: { minimapReversed: minimapReversed },
-			});
+			fireAndForget(this.updateGraphConfig({ minimapReversed: minimapReversed }), 'configuration/update');
 			return;
 		}
 
@@ -5477,9 +5509,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 				minimapMarkerTypes = [...currentTypes];
 				minimapMarkerTypes.splice(index, 1);
 			}
-			this._ipc.sendCommand(UpdateGraphConfigurationCommand, {
-				changes: { minimapMarkerTypes: minimapMarkerTypes },
-			});
+			fireAndForget(this.updateGraphConfig({ minimapMarkerTypes: minimapMarkerTypes }), 'configuration/update');
 		}
 	}
 
@@ -5634,9 +5664,11 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		// Already have stats for this row (user re-selected it) — nothing to do.
 		if (current.workDirStats != null && !current.workDirStatsStale) return;
 
+		const services = this.services;
+		if (services == null) return;
+
 		const ticket = this.graphState.claimWipStatsRequest([sha]);
-		const response = await this._ipc.sendRequest(GetWipStatsRequest, { shas: [sha], force: true });
-		if (response == null) return;
+		const response = (await (await services.wip).getStats([sha], { force: true })) ?? {};
 
 		// A newer request for this row supersedes ours regardless of which response lands first — batches
 		// no longer cancel each other, and the responses carry no revision to order by.
@@ -5672,14 +5704,20 @@ export class GraphApp extends SignalWatcher(LitElement) {
 	}
 
 	// The Changes header mode picker's pick — a dedicated host write (not the columns persist, which drops
-	// echoed `mode`), keeping `setColumnMode` host-authoritative. Mirrors `gl-graph-filter-column`'s route.
-	private handleGraphChangeColumnMode(e: CustomEventType<'gl-graph-change-column-mode'>) {
-		this._ipc.sendCommand(UpdateColumnModeCommand, { name: e.detail.name, mode: e.detail.mode });
+	// echoed `mode`), keeping the mode host-authoritative. Mirrors `gl-graph-filter-column`'s route.
+	private handleGraphChangeColumnMode(e: CustomEventType<'gl-graph-change-column-mode'>): void {
+		const services = this.services;
+		if (services == null) return;
+
+		notifyService(services.columns, 'set column mode', svc => svc.setColumnMode(e.detail.name, e.detail.mode));
 	}
 
 	// The dormant Changes column's one-time opt-in — a dedicated consent write (`graph.changesColumn.enabled`).
-	private handleGraphEnableChangesColumn(_e: CustomEventType<'gl-graph-enable-changes-column'>) {
-		this._ipc.sendCommand(EnableChangesColumnCommand, undefined);
+	private handleGraphEnableChangesColumn(_e: CustomEventType<'gl-graph-enable-changes-column'>): void {
+		const services = this.services;
+		if (services == null) return;
+
+		notifyService(services.columns, 'enable changes column', svc => svc.enableChangesColumn());
 	}
 
 	private handleGraphFilterColumn(e: CustomEventType<'gl-graph-filter-column'>) {
@@ -5879,12 +5917,16 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		this.graphHover.resetUnhoverTimer();
 	}
 
-	private async getRowHoverPromise(row: GitGraphRow) {
+	private async getRowHoverPromise(row: GitGraphRow): Promise<DidGetRowHoverParams> {
 		try {
-			const request = await this._ipc.sendRequest(GetRowHoverRequest, {
-				type: row.kind,
-				id: row.sha,
-			});
+			this._hoverAbort?.abort();
+			const abort = new AbortController();
+			this._hoverAbort = abort;
+
+			const hover = await this.services?.hover;
+			if (hover == null) throw new Error('Graph hover service unavailable');
+
+			const request = await hover.getRowHover(row.kind, row.sha, abort.signal);
 
 			const count = this._hoverTrackingCounter.next();
 			if (count === 1 || count % 100 === 0) {

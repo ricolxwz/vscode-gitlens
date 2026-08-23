@@ -4,12 +4,6 @@ import { css, html, LitElement, nothing } from 'lit';
 import { customElement, property, query, state } from 'lit/decorators.js';
 import type { GraphActivityDecay } from '../../../../../config.js';
 import type { AgentSessionState } from '../../../../home/protocol.js';
-import type { TreemapFileActionParams } from '../../../../plus/graph/protocol.js';
-import {
-	DidInvalidateGraphTreemapNotification,
-	TreemapFileActionCommand,
-	UpdateGraphConfigurationCommand,
-} from '../../../../plus/graph/protocol.js';
 import type { TimelinePeriod } from '../../../../plus/timeline/protocol.js';
 import { periodToMs } from '../../../../plus/timeline/utils/period.js';
 import type {
@@ -19,8 +13,8 @@ import type {
 	TreemapMode,
 	TreemapNode,
 } from '../../../../plus/treemap/protocol.js';
+import { notifyService } from '../../../shared/actions/rpc.js';
 import { filterAgentSessionsForFamily, isAgentSessionCurrentInFamily } from '../../../shared/agentUtils.js';
-import { ipcContext } from '../../../shared/contexts/ipc.js';
 import type { Disposable } from '../../../shared/events.js';
 import { emitTelemetrySentEvent } from '../../../shared/telemetry.js';
 import { periodLabels } from '../../timeline/components/header.js';
@@ -360,10 +354,8 @@ export class GlGraphTreemap extends SignalWatcher(LitElement) {
 	private graphState!: typeof graphStateContext.__context__;
 
 	@consume({ context: graphServicesContext, subscribe: true })
+	@state()
 	private services?: typeof graphServicesContext.__context__;
-
-	@consume({ context: ipcContext })
-	private _ipc?: typeof ipcContext.__context__;
 
 	@state()
 	private _data?: TreemapData;
@@ -389,6 +381,12 @@ export class GlGraphTreemap extends SignalWatcher(LitElement) {
 	private _chart?: GlTreemapChart;
 
 	private readonly _subscriptions: Disposable[] = [];
+
+	/** Guards {@link subscribeToInvalidations} from firing twice for the same connection. `services`
+	 *  is unresolved on a cold open (RPC not yet connected) — `updated()` re-attempts once the
+	 *  `@state()`-tracked context arrives, mirroring `_servicesResolved` in gl-graph-details-panel.
+	 *  Reset on disconnect so a remount re-arms the subscription attempt. */
+	private _servicesSubscribed = false;
 
 	/** Repo path the currently-held `_data` was fetched for. Gates render against `effectiveRepo.path`
 	 *  so a cross-repo remount (where `_data` survives but the active repo flipped) doesn't paint
@@ -451,33 +449,53 @@ export class GlGraphTreemap extends SignalWatcher(LitElement) {
 
 	override connectedCallback(): void {
 		super.connectedCallback?.();
-		this.subscribeToInvalidations();
 		void this.refreshIfNeeded();
 	}
 
 	/** Subscribe to host treemap-invalidation pushes. The host fires this when its per-repo
 	 *  aggregator cache is dropped (file watcher edits, branch switches, repo unload). We bust
 	 *  BOTH fingerprint gates so the next refreshIfNeeded refetches fresh data rather than
-	 *  short-circuiting on a stale success or stale error fingerprint match. */
-	private subscribeToInvalidations(): void {
-		const ipc = this._ipc;
-		if (ipc == null) return;
+	 *  short-circuiting on a stale success or stale error fingerprint match.
+	 *
+	 *  `onDidInvalidate` is `save-last` buffered host-side, so an invalidation queued while this
+	 *  component is unmounted (or hidden) is replaced by the newest one rather than queued — matches
+	 *  the legacy notification's behavior, where a hidden webview only ever saw the latest pending
+	 *  postMessage on reveal. */
+	private async subscribeToInvalidations(): Promise<void> {
+		const services = this.services;
+		if (services == null) return;
 
-		this._subscriptions.push(
-			ipc.onReceiveMessage(msg => {
-				if (!DidInvalidateGraphTreemapNotification.is(msg)) return;
-				if (msg.params.repoPath !== this.effectiveRepo?.path) return;
+		let graphTreemap;
+		try {
+			graphTreemap = await services.graphTreemap;
+		} catch {
+			// The RPC surface can reject (channel torn down, service not yet available) — degrade to
+			// polling-free (refreshIfNeeded still runs on repo/mode changes) rather than leaving an
+			// unhandled rejection.
+			return;
+		}
 
-				this._lastFingerprint = undefined;
-				this._lastErrorFingerprint = undefined;
-				// Also abort any in-flight refresh — its result is now stale relative to the new
-				// host-side state, and the in-flight dedup would otherwise swallow this invalidation.
-				this._abortController?.abort();
-				this._abortController = undefined;
-				this._inFlightFingerprint = undefined;
-				void this.refreshIfNeeded();
-			}),
-		);
+		const unsub = graphTreemap.onDidInvalidate(payload => {
+			if (payload.repoPath !== this.effectiveRepo?.path) return;
+
+			this._lastFingerprint = undefined;
+			this._lastErrorFingerprint = undefined;
+			// Also abort any in-flight refresh — its result is now stale relative to the new
+			// host-side state, and the in-flight dedup would otherwise swallow this invalidation.
+			this._abortController?.abort();
+			this._abortController = undefined;
+			this._inFlightFingerprint = undefined;
+			void this.refreshIfNeeded();
+		});
+
+		// A disconnect (or reconnect) can race this await — unsub immediately instead of leaking the
+		// listener on an unmounted component.
+		if (!this.isConnected) {
+			void Promise.resolve(unsub).then(fn => fn?.());
+			return;
+		}
+
+		this._subscriptions.push({ dispose: () => void Promise.resolve(unsub).then(fn => fn?.()) });
 	}
 
 	override disconnectedCallback(): void {
@@ -503,6 +521,8 @@ export class GlGraphTreemap extends SignalWatcher(LitElement) {
 		this._repoFamilySessionsCache = undefined;
 		// Re-arm the impression telemetry so the next mount records a fresh `shown`.
 		this._shownEmittedKey = undefined;
+		// Re-arm the subscription attempt for the next mount.
+		this._servicesSubscribed = false;
 	}
 
 	override willUpdate(): void {
@@ -529,6 +549,16 @@ export class GlGraphTreemap extends SignalWatcher(LitElement) {
 	}
 
 	override updated(): void {
+		// Cold open races the RPC connection: `services` (a `@state()`-tracked `@consume`) is
+		// undefined on first render, so attempt the subscription here instead of only at connect —
+		// this re-fires once the context arrives. Flag-gated rather than `changedProperties`-gated:
+		// on a remount the context value is already set and never "changes", so the reset flag alone
+		// is what re-arms the subscription.
+		if (this.services != null && !this._servicesSubscribed) {
+			this._servicesSubscribed = true;
+			void this.subscribeToInvalidations();
+		}
+
 		void this.refreshIfNeeded();
 		// Dispatch lives in `updated()` (post-render) rather than `willUpdate()` — emitting an
 		// event mid-update can re-trigger Lit's render cycle and cause double renders or stale
@@ -1023,11 +1053,11 @@ export class GlGraphTreemap extends SignalWatcher(LitElement) {
 		);
 	};
 
-	/** Dispatches the activity-decay setting change as an IPC `UpdateGraphConfigurationCommand`
-	 *  so the host persists it to `gitlens.graph.experimental.visualizations.activityDecay`. The
-	 *  resolved `activityDecayMs` flows back via the normal config push, so the chart sees the
-	 *  new window on its next render. No optimistic local state — we lean on the config-changed
-	 *  round-trip rather than maintaining a parallel signal. */
+	/** Dispatches the activity-decay setting change via RPC so the host persists it to
+	 *  `gitlens.graph.experimental.visualizations.activityDecay`. The resolved `activityDecayMs`
+	 *  flows back via the normal config push, so the chart sees the new window on its next render.
+	 *  No optimistic local state — we lean on the config-changed round-trip rather than maintaining
+	 *  a parallel signal. */
 	private readonly onDecayMenuSelect = (e: CustomEvent<{ value: string }>): void => {
 		const decay = e.detail.value as GraphActivityDecay;
 		// Default to '5m' to match the picker's own default (see render()), so `decay.old` reports
@@ -1040,7 +1070,11 @@ export class GlGraphTreemap extends SignalWatcher(LitElement) {
 			name: 'graph/treemap/decayChanged',
 			data: { 'decay.old': previous, 'decay.new': decay },
 		});
-		this._ipc?.sendCommand(UpdateGraphConfigurationCommand, { changes: { activityDecay: decay } });
+
+		const services = this.services;
+		if (services != null) {
+			notifyService(services.configuration, 'configuration/update', svc => svc.update({ activityDecay: decay }));
+		}
 	};
 
 	override render(): unknown {
@@ -1276,7 +1310,7 @@ export class GlGraphTreemap extends SignalWatcher(LitElement) {
 		});
 	}
 
-	private sendFileAction(action: TreemapFileActionParams['action'], absPath: string): void {
+	private sendFileAction(action: 'open' | 'history', absPath: string): void {
 		// Send the repo-relative path + the repo it belongs to, so the host can scheme-preserve
 		// the URI rehydration (Uri.file() on the host would coerce virtual-workspace paths to
 		// non-resolving file:// URIs). Skip if we can't resolve a repo — shouldn't happen for a
@@ -1288,11 +1322,12 @@ export class GlGraphTreemap extends SignalWatcher(LitElement) {
 		const relPath = toRepoRelative(rootPath, absPath);
 		if (relPath == null) return;
 
-		this._ipc?.sendCommand(TreemapFileActionCommand, {
-			action: action,
-			repoPath: rootPath,
-			path: relPath,
-		});
+		const services = this.services;
+		if (services == null) return;
+
+		notifyService(services.rowActions, 'rowActions/treemapFile', svc =>
+			svc.openTreemapFile(action, rootPath, relPath),
+		);
 	}
 
 	/** Locate the agent session currently reading or writing the clicked file. Both sides are

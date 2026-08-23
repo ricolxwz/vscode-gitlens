@@ -1,3 +1,4 @@
+import type { Remote } from '@eamodio/supertalk';
 import { SignalWatcher } from '@lit-labs/signals';
 import { consume } from '@lit/context';
 import type { PropertyValues } from 'lit';
@@ -8,27 +9,22 @@ import type { HierarchicalItem } from '@gitlens/utils/array.js';
 import { makeHierarchical } from '@gitlens/utils/array.js';
 import type { GraphBranchesVisibility } from '../../../../../config.js';
 import type { RepositoryShape } from '../../../../../git/models/repositoryShape.js';
+import type { GraphServices } from '../../../../plus/graph/graphService.js';
 import type {
 	DidGetSidebarDataParams,
+	GraphComponentConfig,
 	GraphExcludeTypes,
 	GraphRefOptData,
 	GraphScopeOrigin,
 	GraphSidebarBranch,
 	GraphSidebarPullRequest,
-	UpdateGraphConfigurationParams,
 } from '../../../../plus/graph/protocol.js';
-import {
-	ResetGraphFiltersCommand,
-	UpdateExcludeTypesCommand,
-	UpdateGraphConfigurationCommand,
-	UpdateIncludedRefsCommand,
-} from '../../../../plus/graph/protocol.js';
+import { notifyService } from '../../../shared/actions/rpc.js';
 import type { GlPopover } from '../../../shared/components/overlays/popover.js';
 import type { TreeItemDecoration, TreeItemSelectionDetail, TreeModel } from '../../../shared/components/tree/base.js';
 import type { GlTreeView } from '../../../shared/components/tree/tree-view.js';
-import { ipcContext } from '../../../shared/contexts/ipc.js';
 import type { ResourceStatus } from '../../../shared/state/resource.js';
-import { graphStateContext } from '../context.js';
+import { graphServicesContext, graphStateContext } from '../context.js';
 import { branchTreeIcon, remoteProviderFolderIcon, remoteProviderIconsByName } from '../sidebar/branchActions.utils.js';
 import {
 	getPullRequestNumberFromQuery,
@@ -76,8 +72,8 @@ export function isGraphFiltered(graphState: typeof graphStateContext.__context__
 export class GlGraphScopePopover extends SignalWatcher(LitElement) {
 	static override styles = [graphScopePopoverStyles];
 
-	@consume({ context: ipcContext })
-	private _ipc!: typeof ipcContext.__context__;
+	@consume({ context: graphServicesContext, subscribe: true })
+	private _services?: Remote<GraphServices> | undefined;
 
 	@consume({ context: graphStateContext, subscribe: true })
 	private graphState!: typeof graphStateContext.__context__;
@@ -1083,7 +1079,10 @@ export class GlGraphScopePopover extends SignalWatcher(LitElement) {
 		e.stopPropagation();
 		e.preventDefault();
 		this.graphState.deferScopeClear();
-		this._ipc.sendCommand(ResetGraphFiltersCommand, undefined);
+		const services = this._services;
+		if (services != null) {
+			notifyService(services.filters, 'filters/reset', svc => svc.reset());
+		}
 		this.hideModePopover();
 	};
 
@@ -1121,16 +1120,25 @@ export class GlGraphScopePopover extends SignalWatcher(LitElement) {
 		}
 	}
 
-	private changeGraphConfiguration(changes: UpdateGraphConfigurationParams['changes']) {
-		this._ipc.sendCommand(UpdateGraphConfigurationCommand, { changes: changes });
+	private changeGraphConfiguration(changes: Partial<GraphComponentConfig>) {
+		const services = this._services;
+		if (services == null) return;
+
+		notifyService(services.configuration, 'configuration/update', svc => svc.update(changes));
 	}
 
 	private onExcludeTypesChanged(key: keyof GraphExcludeTypes, value: boolean) {
-		this._ipc.sendCommand(UpdateExcludeTypesCommand, { key: key, value: value });
+		const services = this._services;
+		if (services == null) return;
+
+		notifyService(services.filters, 'filters/excludeTypes', svc => svc.setExcludeType(key, value));
 	}
 
 	private onRefIncludesChanged(branchesVisibility: GraphBranchesVisibility, refs?: GraphRefOptData[]) {
-		this._ipc.sendCommand(UpdateIncludedRefsCommand, { branchesVisibility: branchesVisibility, refs: refs });
+		const services = this._services;
+		if (services == null) return;
+
+		notifyService(services.filters, 'filters/includedRefs', svc => svc.setIncludedRefs(branchesVisibility, refs));
 	}
 }
 
