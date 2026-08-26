@@ -35,8 +35,6 @@ import { detailsBaseStyles } from './gl-details-base.css.js';
 import type { File } from './gl-details-base.js';
 import { GlDetailsBase } from './gl-details-base.js';
 import { detailsCommitPanelStyles } from './gl-details-commit-panel.css.js';
-import '../../shared/components/ai-input.js';
-import '../../shared/components/gl-ai-model-chip.js';
 import '../../shared/components/branch-name.js';
 import '../../shared/components/button.js';
 import '../../shared/components/chips/action-chip.js';
@@ -90,9 +88,6 @@ export class GlDetailsCommitPanel extends GlDetailsBase {
 	get isStash(): boolean {
 		return this.commit?.stashNumber != null;
 	}
-
-	@state()
-	explainBusy = false;
 
 	@property({ type: Object })
 	explain?: ExplainState;
@@ -268,11 +263,9 @@ export class GlDetailsCommitPanel extends GlDetailsBase {
 
 	override updated(changedProperties: Map<string, any>): void {
 		if (changedProperties.has('explain')) {
-			this.explainBusy = false;
 			this.renderRoot.querySelector('[data-region="commit-explanation"]')?.scrollIntoView();
 		}
 		if (changedProperties.has('commit')) {
-			this.explainBusy = false;
 			this._reachabilityExpanded = false;
 			this.renderRoot.querySelector('[data-region="message"]')?.scrollTo?.(0, 0);
 		}
@@ -336,7 +329,7 @@ export class GlDetailsCommitPanel extends GlDetailsBase {
 										<div slot="start" class="msg-slot">${this.renderEmbeddedMessage()}</div>
 										<div slot="divider" class="split__handle"></div>
 										<div slot="end" class="bottom-section">
-											${this.renderEmbeddedAutolinks()} ${this.renderEmbeddedExplainInput()}
+											${this.renderEmbeddedAutolinks()}
 											<div class="files">
 												<webview-pane-group flexible>
 													${this.renderChangedFiles(fileMode, renderOpts)}
@@ -840,20 +833,10 @@ export class GlDetailsCommitPanel extends GlDetailsBase {
 		// feature the user just disabled. Matches the compare and multi-commit panels.
 		if (!this.autolinksEnabled) return nothing;
 
-		return html`<div class="autolinks">${this.renderAutoLinksChips()}</div>`;
-	}
+		const chips = this.renderAutoLinksChips();
+		if (chips === nothing) return nothing;
 
-	private renderEmbeddedExplainInput() {
-		if (this.orgSettings?.ai === false) return nothing;
-
-		return html`<gl-ai-input
-			multiline
-			floating-footer
-			.busy=${this.explainBusy}
-			@gl-explain=${this.onExplainChanges}
-		>
-			<gl-ai-model-chip slot="footer" .model=${this.aiModel}></gl-ai-model-chip>
-		</gl-ai-input>`;
+		return html`<div class="autolinks">${chips}</div>`;
 	}
 
 	private onToggleReachability() {
@@ -1023,25 +1006,13 @@ export class GlDetailsCommitPanel extends GlDetailsBase {
 	private renderAutoLinksChips() {
 		const autolinkState = this.autolinkState;
 		if (autolinkState == null) {
-			return this._commitChanging
-				? this.renderAutolinksLoading()
-				: renderLearnAboutAutolinks({
-						hasIntegrationsConnected: this.hasIntegrationsConnected,
-						hasAccount: this.hasAccount,
-						showLabel: true,
-					});
+			return this._commitChanging ? this.renderAutolinksLoading() : nothing;
 		}
 
 		const { autolinks, issues, prs, size } = autolinkState;
 
 		if (size === 0) {
-			return this._commitChanging
-				? this.renderAutolinksLoading()
-				: renderLearnAboutAutolinks({
-						hasIntegrationsConnected: this.hasIntegrationsConnected,
-						hasAccount: this.hasAccount,
-						showLabel: true,
-					});
+			return this._commitChanging ? this.renderAutolinksLoading() : nothing;
 		}
 
 		return html`<gl-chip-overflow max-rows="1">
@@ -1241,23 +1212,6 @@ export class GlDetailsCommitPanel extends GlDetailsBase {
 				</div>
 			</div>
 		</gl-popover>`;
-	}
-
-	private onExplainChanges(e: CustomEvent<{ prompt?: string }> | MouseEvent) {
-		if (this.explainBusy) {
-			e.preventDefault();
-			e.stopPropagation();
-			return;
-		}
-
-		e.stopPropagation();
-		this.explainBusy = true;
-
-		const prompt = e instanceof CustomEvent ? e.detail?.prompt : undefined;
-
-		this.dispatchEvent(
-			new CustomEvent('explain-commit', { detail: { prompt: prompt }, bubbles: true, composed: true }),
-		);
 	}
 
 	override getFileActions(file: File, _options?: Partial<TreeItemBase>): TreeItemAction[] {
